@@ -1,0 +1,1885 @@
+--[[ TNThud v14.0 — Blox Fruits (Performance-first rewrite)
+  Tối ưu: ít code, ít lag, không màu mè. Ưu tiên hiệu quả.
+  • Fly CFrame-lerp alpha 0.5 — mượt, không snap back
+  • AutoFarm 1 vòng lặp, click qua tool:Activate
+  • BringMob set CFrame trực tiếp, không BodyVelocity
+  • MobCache 0.5s, ESP 3s, Click 12/sec — không spam
+  • UI đơn giản: button + toggle + dropdown + slider, bỏ gradient/animation
+]]
+
+local Players=game:GetService("Players")
+local RS=game:GetService("RunService")
+local UIS=game:GetService("UserInputService")
+local TS=game:GetService("TweenService")
+local ReSto=game:GetService("ReplicatedStorage")
+local WS=game:GetService("Workspace")
+local Light=game:GetService("Lighting")
+local HS=game:GetService("HttpService")
+local SG=game:GetService("StarterGui")
+local VU=game:GetService("VirtualUser")
+local TPS=game:GetService("TeleportService")
+
+local LP=Players.LocalPlayer
+local Cam=WS.CurrentCamera
+local IS_MOB=UIS.TouchEnabled and not UIS.KeyboardEnabled
+
+local SEA=0
+if game.PlaceId==2753915549 or game.PlaceId==85211729168715 then SEA=1
+elseif game.PlaceId==4442272183 or game.PlaceId==79091703265657 then SEA=2
+elseif game.PlaceId==7449423635 or game.PlaceId==100117331123089 then SEA=3 end
+
+-- COLORS (đơn giản, không cần nhiều)
+local C={Bg=Color3.fromRGB(25,25,30),Surface=Color3.fromRGB(40,40,48),Hi=Color3.fromRGB(60,60,70),
+Primary=Color3.fromRGB(225,95,65),Text=Color3.fromRGB(240,240,240),Sub=Color3.fromRGB(160,160,170),
+Green=Color3.fromRGB(80,200,120),Red=Color3.fromRGB(220,70,70),Yellow=Color3.fromRGB(240,200,80),Blue=Color3.fromRGB(80,150,255)}
+
+-- UTILS
+local function notify(t,x,d) pcall(function() SG:SetCore("SendNotification",{Title=t,Text=x,Duration=d or 3}) end) end
+local function getGui() if gethui then return gethui() end local ok,g=pcall(function() if not RS:IsStudio() then return game:GetService("CoreGui") end end) return (ok and g) or LP:WaitForChild("PlayerGui") end
+local function make(c,p) local i=Instance.new(c) if p then for k,v in pairs(p) do i[k]=v end end return i end
+local function corner(p,r) make("UICorner",{CornerRadius=UDim.new(0,r or 4),Parent=p}) end
+local function chr() return LP.Character end
+local function hrp() local c=chr() return c and c:FindFirstChild("HumanoidRootPart") end
+local function hum() local c=chr() return c and c:FindFirstChildOfClass("Humanoid") end
+
+local Rem=nil
+local function INV(...)
+    local r=Rem and Rem.Parent and Rem or ReSto:FindFirstChild("Remotes") if r then Rem=r end
+    if not r then return end
+    local f=r:FindFirstChild("CommF_") if not f then return end
+    local ok,res=pcall(function() return f:InvokeServer(...) end)
+    return ok and res or nil
+end
+
+-- TWEEN di chuyển (cho TP, không phải farm)
+local curTween=nil
+local function toTarget(cf,spd)
+    local h=hrp() if not h then return end
+    spd=spd or 300
+    local dist=(cf.Position-h.Position).Magnitude
+    if dist<4 then return end
+    if curTween then curTween:Cancel() end
+    curTween=TS:Create(h,TweenInfo.new(math.max(dist/spd,0.08),Enum.EasingStyle.Linear),{CFrame=cf})
+    curTween:Play()
+end
+local function stopMove() if curTween then curTween:Cancel() curTween=nil end end
+
+-- ===== FLY (CFrame lerp — KHÔNG BodyVelocity/BodyGyro/ChangeState) =====
+local Fly={On=false,Speed=100,Conn=nil,Goto=nil,
+    Joy={X=0,Y=0,Up=false,Down=false},JoyUI=nil,JoyConn={}}
+
+local function buildJoyUI(parent)
+    if Fly.JoyUI or not IS_MOB then return end
+    local j=make("Frame",{Size=UDim2.new(0,130,0,130),Position=UDim2.new(0,12,1,-150),
+        BackgroundColor3=C.Surface,BorderSizePixel=0,Visible=false,Parent=parent})
+    corner(j,8)
+    local knob=make("Frame",{Size=UDim2.new(0,38,0,38),Position=UDim2.new(0.5,-19,0.5,-19),
+        BackgroundColor3=C.Primary,BorderSizePixel=0,Parent=j}) corner(knob,19)
+    local up=make("TextButton",{Size=UDim2.new(0,42,0,42),Position=UDim2.new(1,4,0,4),
+        BackgroundColor3=C.Hi,Text="↑",Font=Enum.Font.GothamBold,TextSize=18,TextColor3=C.Text,
+        AutoButtonColor=false,BorderSizePixel=0,Parent=j}) corner(up,4)
+    local dn=make("TextButton",{Size=UDim2.new(0,42,0,42),Position=UDim2.new(1,4,0,52),
+        BackgroundColor3=C.Hi,Text="↓",Font=Enum.Font.GothamBold,TextSize=18,TextColor3=C.Text,
+        AutoButtonColor=false,BorderSizePixel=0,Parent=j}) corner(dn,4)
+    local dragging=false
+    local c1=j.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true end
+    end)
+    local c2=UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseMovement) then
+            local cp,sz=j.AbsolutePosition,j.AbsoluteSize
+            Fly.Joy.X=math.clamp((i.Position.X-(cp.X+sz.X/2))/math.max(1,sz.X/2-8),-1,1)
+            Fly.Joy.Y=math.clamp((i.Position.Y-(cp.Y+sz.Y/2))/math.max(1,sz.Y/2-8),-1,1)
+            knob.Position=UDim2.new(0.5,-19+Fly.Joy.X*(sz.X/2-19),0.5,-19+Fly.Joy.Y*(sz.Y/2-19))
+        end
+    end)
+    local c3=UIS.InputEnded:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then
+            if dragging then dragging=false Fly.Joy.X=0 Fly.Joy.Y=0
+                TS:Create(knob,TweenInfo.new(0.1),{Position=UDim2.new(0.5,-19,0.5,-19)}):Play() end
+        end
+    end)
+    local function bind(b,f)
+        b.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then Fly.Joy[f]=true end end)
+        b.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then Fly.Joy[f]=false end end)
+    end
+    bind(up,"Up") bind(dn,"Down")
+    Fly.JoyConn={c1,c2,c3}
+    Fly.JoyUI=j
+end
+
+function Fly:Start()
+    if self.Conn then self.Conn:Disconnect() end
+    self.Goto=nil
+    local h=hrp() if not h then return end
+    if self.JoyUI then self.JoyUI.Visible=true end
+    local hm=hum() if hm then hm.PlatformStand=true end
+    self.Conn=RS.Heartbeat:Connect(function()
+        local h2=hrp() if not h2 then return end
+        -- Auto-bay tới target
+        if self.Goto then
+            local dir=self.Goto-h2.Position
+            local dist=dir.Magnitude
+            if dist<8 then self.Goto=nil notify("Bay","Đã tới nơi",2) return end
+            local sp=dist<60 and self.Speed*0.6 or self.Speed
+            local newPos=h2.Position+dir.Unit*math.min(dist,sp*0.1)
+            h2.CFrame=h2.CFrame:Lerp(CFrame.lookAt(newPos,newPos+dir),0.5)
+            h2.Velocity=Vector3.zero
+            return
+        end
+        -- Di chuyển theo input
+        local cc=Cam.CFrame
+        local m=Vector3.zero
+        if IS_MOB then
+            m=cc.LookVector*(-self.Joy.Y)+cc.RightVector*self.Joy.X
+            if self.Joy.Up then m=m+Vector3.new(0,1,0) end
+            if self.Joy.Down then m=m-Vector3.new(0,1,0) end
+        else
+            if UIS:IsKeyDown(Enum.KeyCode.W) then m=m+cc.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.S) then m=m-cc.LookVector end
+            if UIS:IsKeyDown(Enum.KeyCode.A) then m=m-cc.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.D) then m=m+cc.RightVector end
+            if UIS:IsKeyDown(Enum.KeyCode.Space) then m=m+Vector3.new(0,1,0) end
+            if UIS:IsKeyDown(Enum.KeyCode.LeftShift) then m=m-Vector3.new(0,1,0) end
+        end
+        if m.Magnitude>0.01 then
+            local tgt=h2.Position+m.Unit*(self.Speed*0.1)
+            h2.CFrame=h2.CFrame:Lerp(CFrame.new(tgt,tgt+cc.LookVector),0.5)
+        end
+        h2.Velocity=Vector3.zero  -- clear momentum mỗi frame
+    end)
+end
+
+function Fly:Stop()
+    if self.Conn then self.Conn:Disconnect() self.Conn=nil end
+    self.Goto=nil
+    if self.JoyUI then self.JoyUI.Visible=false end
+    self.Joy.X=0 self.Joy.Y=0 self.Joy.Up=false self.Joy.Down=false
+    local hm=hum() if hm then hm.PlatformStand=false end
+end
+
+function Fly:GotoTarget(pos)
+    if not pos then return end
+    self.Goto=pos
+    if not self.On then self.On=true self:Start() end
+end
+
+function Fly:Toggle(v) self.On=v if v then self:Start() else self:Stop() end end
+
+LP.CharacterAdded:Connect(function()
+    task.wait(1)
+    if Fly.On then Fly:Stop() task.wait(0.3) Fly:Start() end
+end)
+
+-- ===== FRUIT EMOJI =====
+local FE={["Rocket"]="🚀",["Spin"]="🌀",["Chop"]="💥",["Spring"]="🌱",["Bomb"]="💣",["Smoke"]="💨",
+    ["Spike"]="🌵",["Flame"]="🔥",["Falcon"]="🦅",["Ice"]="❄️",["Sand"]="⏳",["Dark"]="🌑",
+    ["Diamond"]="💎",["Light"]="💡",["Rubber"]="🟡",["Barrier"]="🛡️",["Magma"]="🌋",["Door"]="🚪",
+    ["Leopard"]="🐆",["Dough"]="🍩",["Venom"]="🐍",["Shadow"]="👤",["Control"]="🎮",["Spirit"]="👻",
+    ["Gravity"]="🌍",["Paw"]="🐾",["Phoenix"]="🦅",["Rumble"]="⚡",["Buddha"]="🧘",["Spider"]="🕷️",
+    ["Sound"]="🎵",["Dragon"]="🐉",["Kitsune"]="🦊",["T-Rex"]="🦖",["Gas"]="☁️",["Blizzard"]="🌨️",
+    ["Yeti"]="🦍",["Quake"]="🌋",["String"]="🧵",["Human: Buddha"]="🧘"}
+local function parseFruit(n)
+    if not n then return "?","🍎" end
+    local s=n:gsub("%s*%-?%s*Fruit%s*$",""):gsub("%s*%([^)]*%)%s*$","")
+    s=s:match("^%s*(.-)%s*$") or s
+    return s,FE[s] or "🍎"
+end
+
+-- ===== QUEST DATA =====
+local Q={
+{lv=1,ms="Bandit [Lv. 5]",q="BanditQuest1",n=1,m="Bandit",cq=CFrame.new(1061.67,16.52,1544.53),cm=CFrame.new(1199.31,52.27,1536.92)},
+{lv=10,ms="Monkey [Lv. 14]",q="JungleQuest",n=1,m="Monkey",cq=CFrame.new(-1604.12,36.85,154.24),cm=CFrame.new(-1772.41,60.86,54.87)},
+{lv=15,ms="Gorilla [Lv. 20]",q="JungleQuest",n=2,m="Gorilla",cq=CFrame.new(-1604.12,36.85,154.24),cm=CFrame.new(-1223.53,6.28,-502.29)},
+{lv=30,ms="Pirate [Lv. 35]",q="BuggyQuest1",n=1,m="Pirate",cq=CFrame.new(-1139.60,4.75,3825.16),cm=CFrame.new(-1219.32,4.75,3915.63)},
+{lv=40,ms="Brute [Lv. 45]",q="BuggyQuest1",n=2,m="Brute",cq=CFrame.new(-1139.60,4.75,3825.16),cm=CFrame.new(-1146.50,96.09,4312.13)},
+{lv=60,ms="Desert Bandit [Lv. 60]",q="DesertQuest",n=1,m="Desert Bandit",cq=CFrame.new(897.03,6.44,4388.97),cm=CFrame.new(932.79,6.45,4488.25)},
+{lv=75,ms="Desert Officer [Lv. 70]",q="DesertQuest",n=2,m="Desert Officer",cq=CFrame.new(897.03,6.44,4388.97),cm=CFrame.new(1580.03,4.61,4366.86)},
+{lv=90,ms="Snow Bandit [Lv. 90]",q="SnowQuest",n=1,m="Snow Bandit",cq=CFrame.new(1384.14,87.27,-1297.06),cm=CFrame.new(1370.24,102.40,-1411.53)},
+{lv=100,ms="Snowman [Lv. 100]",q="SnowQuest",n=2,m="Snowman",cq=CFrame.new(1384.14,87.27,-1297.06),cm=CFrame.new(1370.24,102.40,-1411.53)},
+{lv=120,ms="Chief Petty Officer [Lv. 120]",q="MarineQuest2",n=1,m="Chief Petty Officer",cq=CFrame.new(-5035.08,28.65,4325.29),cm=CFrame.new(-4882.86,22.65,4255.54)},
+{lv=150,ms="Sky Bandit [Lv. 150]",q="SkyQuest",n=1,m="Sky Bandit",cq=CFrame.new(-4841.83,717.67,-2623.96),cm=CFrame.new(-4970.74,294.54,-2890.11)},
+{lv=175,ms="Dark Master [Lv. 175]",q="SkyQuest",n=2,m="Dark Master",cq=CFrame.new(-4841.83,717.67,-2623.96),cm=CFrame.new(-5220.59,430.69,-2278.17)},
+{lv=225,ms="Toga Warrior [Lv. 225]",q="ColosseumQuest",n=1,m="Toga Warrior",cq=CFrame.new(-1576.12,7.39,-2983.31),cm=CFrame.new(-1779.98,44.61,-2736.35)},
+{lv=275,ms="Gladiator [Lv. 275]",q="ColosseumQuest",n=2,m="Gladiator",cq=CFrame.new(-1576.12,7.39,-2983.31),cm=CFrame.new(-1274.76,58.19,-3188.16)},
+{lv=300,ms="Military Soldier [Lv. 300]",q="MagmaQuest",n=1,m="Military Soldier",cq=CFrame.new(-5316.56,12.24,8517.30),cm=CFrame.new(-5363.01,41.51,8548.47)},
+{lv=330,ms="Military Spy [Lv. 330]",q="MagmaQuest",n=2,m="Military Spy",cq=CFrame.new(-5316.56,12.24,8517.30),cm=CFrame.new(-5787.99,120.86,8762.25)},
+{lv=375,ms="Fishman Warrior [Lv. 375]",q="FishmanQuest",n=1,m="Fishman Warrior",cq=CFrame.new(61122.56,18.47,1568.17),cm=CFrame.new(61163.85,5.31,1819.78)},
+{lv=400,ms="Fishman Commando [Lv. 400]",q="FishmanQuest",n=2,m="Fishman Commando",cq=CFrame.new(61122.56,18.47,1568.17),cm=CFrame.new(61163.85,5.31,1819.78)},
+{lv=450,ms="God's Guard [Lv. 450]",q="SkyExp1Quest",n=1,m="God's Guard",cq=CFrame.new(-4721.71,845.28,-1954.20),cm=CFrame.new(-4716.96,853.09,-1933.93)},
+{lv=475,ms="Shanda [Lv. 475]",q="SkyExp1Quest",n=2,m="Shanda",cq=CFrame.new(-4721.71,845.28,-1954.20),cm=CFrame.new(-7685.12,5601.05,-443.17)},
+{lv=525,ms="Royal Squad [Lv. 525]",q="SkyExp2Quest",n=1,m="Royal Squad",cq=CFrame.new(-7902.67,5635.96,-1411.72),cm=CFrame.new(-7685.02,5606.88,-1442.73)},
+{lv=550,ms="Royal Soldier [Lv. 550]",q="SkyExp2Quest",n=2,m="Royal Soldier",cq=CFrame.new(-7902.67,5635.96,-1411.72),cm=CFrame.new(-7864.45,5661.94,-1708.22)},
+{lv=625,ms="Galley Pirate [Lv. 625]",q="FountainQuest",n=1,m="Galley Pirate",cq=CFrame.new(5254.60,38.50,4049.70),cm=CFrame.new(5595.07,41.50,3961.47)},
+{lv=650,ms="Galley Captain [Lv. 650]",q="FountainQuest",n=2,m="Galley Captain",cq=CFrame.new(5254.60,38.50,4049.70),cm=CFrame.new(5658.58,38.54,4928.94)},
+{lv=700,ms="Raider [Lv. 700]",q="Area1Quest",n=1,m="Raider",cq=CFrame.new(-424.08,73.01,1836.92),cm=CFrame.new(-737.03,39.17,2392.58)},
+{lv=725,ms="Mercenary [Lv. 725]",q="Area1Quest",n=2,m="Mercenary",cq=CFrame.new(-424.08,73.01,1836.92),cm=CFrame.new(-973.73,95.87,1836.47)},
+{lv=775,ms="Swan Pirate [Lv. 775]",q="Area2Quest",n=1,m="Swan Pirate",cq=CFrame.new(632.70,73.11,918.67),cm=CFrame.new(970.37,142.65,1217.37)},
+{lv=875,ms="Marine Lieutenant [Lv. 875]",q="MarineQuest3",n=1,m="Marine Lieutenant",cq=CFrame.new(-2442.65,73.05,-3219.12),cm=CFrame.new(-2913.26,73.00,-3321.66)},
+{lv=900,ms="Marine Captain [Lv. 900]",q="MarineQuest3",n=2,m="Marine Captain",cq=CFrame.new(-2442.65,73.05,-3219.12),cm=CFrame.new(-1868.68,73.00,-3321.66)},
+{lv=950,ms="Zombie [Lv. 950]",q="ZombieQuest",n=1,m="Zombie",cq=CFrame.new(-5492.79,48.52,-793.71),cm=CFrame.new(-5634.84,126.07,-697.67)},
+{lv=975,ms="Vampire [Lv. 975]",q="ZombieQuest",n=2,m="Vampire",cq=CFrame.new(-5492.79,48.52,-793.71),cm=CFrame.new(-6030.32,6.44,-1313.56)},
+{lv=1000,ms="Snow Trooper [Lv. 1000]",q="SnowMountainQuest",n=1,m="Snow Trooper",cq=CFrame.new(604.96,401.46,-5371.69),cm=CFrame.new(535.89,401.46,-5329.70)},
+{lv=1050,ms="Winter Warrior [Lv. 1050]",q="SnowMountainQuest",n=2,m="Winter Warrior",cq=CFrame.new(604.96,401.46,-5371.69),cm=CFrame.new(1223.74,454.58,-5170.02)},
+{lv=1100,ms="Lab Subordinate [Lv. 1100]",q="IceSideQuest",n=1,m="Lab Subordinate",cq=CFrame.new(-6060.11,15.99,-4904.79),cm=CFrame.new(-5769.20,37.93,-4468.39)},
+{lv=1125,ms="Horned Warrior [Lv. 1125]",q="IceSideQuest",n=2,m="Horned Warrior",cq=CFrame.new(-6060.11,15.99,-4904.79),cm=CFrame.new(-6400.86,24.76,-5818.64)},
+{lv=1175,ms="Magma Ninja [Lv. 1175]",q="FireSideQuest",n=1,m="Magma Ninja",cq=CFrame.new(-5431.09,15.99,-5296.53),cm=CFrame.new(-5496.66,58.69,-5929.77)},
+{lv=1200,ms="Lava Pirate [Lv. 1200]",q="FireSideQuest",n=2,m="Lava Pirate",cq=CFrame.new(-5431.09,15.99,-5296.53),cm=CFrame.new(-5169.72,34.12,-4669.74)},
+{lv=1350,ms="Arctic Warrior [Lv. 1350]",q="FrostQuest",n=1,m="Arctic Warrior",cq=CFrame.new(5669.44,28.21,-6482.60),cm=CFrame.new(5995.07,57.32,-6183.47)},
+{lv=1375,ms="Snow Lurker [Lv. 1375]",q="FrostQuest",n=2,m="Snow Lurker",cq=CFrame.new(5669.44,28.21,-6482.60),cm=CFrame.new(5518.01,60.56,-6828.81)},
+{lv=1425,ms="Sea Soldier [Lv. 1425]",q="ForgottenQuest",n=1,m="Sea Soldier",cq=CFrame.new(-3052.99,236.88,-10148.19),cm=CFrame.new(-3030.37,191.13,-9859.80)},
+{lv=1450,ms="Water Fighter [Lv. 1450]",q="ForgottenQuest",n=2,m="Water Fighter",cq=CFrame.new(-3052.99,236.88,-10148.19),cm=CFrame.new(-3436.77,290.52,-10503.44)},
+{lv=1500,ms="Pirate Millionaire [Lv. 1500]",q="PiratePortQuest",n=1,m="Pirate Millionaire",cq=CFrame.new(-290.07,42.90,5581.59),cm=CFrame.new(81.16,43.76,5724.70)},
+{lv=1525,ms="Pistol Billionaire [Lv. 1525]",q="PiratePortQuest",n=2,m="Pistol Billionaire",cq=CFrame.new(-290.07,42.90,5581.59),cm=CFrame.new(81.16,43.76,5724.70)},
+{lv=1575,ms="Dragon Crew Warrior [Lv. 1575]",q="AmazonQuest",n=1,m="Dragon Crew Warrior",cq=CFrame.new(5832.84,51.68,-1101.52),cm=CFrame.new(6242.00,51.52,-1243.98)},
+{lv=1600,ms="Dragon Crew Archer [Lv. 1600]",q="AmazonQuest",n=2,m="Dragon Crew Archer",cq=CFrame.new(5832.84,51.68,-1101.52),cm=CFrame.new(6488.92,383.38,-110.66)},
+{lv=1625,ms="Female Islander [Lv. 1625]",q="AmazonQuest2",n=1,m="Female Islander",cq=CFrame.new(5448.86,601.52,751.13),cm=CFrame.new(5825.22,682.89,704.58)},
+{lv=1650,ms="Giant Islander [Lv. 1650]",q="AmazonQuest2",n=2,m="Giant Islander",cq=CFrame.new(5448.86,601.52,751.13),cm=CFrame.new(4530.35,656.76,-131.61)},
+{lv=1700,ms="Marine Commodore [Lv. 1700]",q="MarineTreeIsland",n=1,m="Marine Commodore",cq=CFrame.new(2180.54,27.82,-6741.55),cm=CFrame.new(2490.08,190.42,-7160.05)},
+{lv=1725,ms="Marine Rear Admiral [Lv. 1725]",q="MarineTreeIsland",n=2,m="Marine Rear Admiral",cq=CFrame.new(2180.54,27.82,-6741.55),cm=CFrame.new(3951.39,229.12,-6912.82)},
+{lv=1775,ms="Fishman Raider [Lv. 1775]",q="DeepForestIsland3",n=1,m="Fishman Raider",cq=CFrame.new(-10581.66,330.87,-8761.19),cm=CFrame.new(-10322.40,390.94,-8580.09)},
+{lv=1800,ms="Fishman Captain [Lv. 1800]",q="DeepForestIsland3",n=2,m="Fishman Captain",cq=CFrame.new(-10581.66,330.87,-8761.19),cm=CFrame.new(-11194.54,442.03,-8608.81)},
+{lv=1825,ms="Forest Pirate [Lv. 1825]",q="DeepForestIsland",n=1,m="Forest Pirate",cq=CFrame.new(-13234.04,331.49,-7625.40),cm=CFrame.new(-13225.81,428.19,-7753.12)},
+{lv=1850,ms="Mythological Pirate [Lv. 1850]",q="DeepForestIsland",n=2,m="Mythological Pirate",cq=CFrame.new(-13234.04,331.49,-7625.40),cm=CFrame.new(-13869.17,564.95,-7084.41)},
+{lv=1900,ms="Jungle Pirate [Lv. 1900]",q="DeepForestIsland2",n=1,m="Jungle Pirate",cq=CFrame.new(-12680.38,389.97,-9902.02),cm=CFrame.new(-11982.22,376.33,-10451.42)},
+{lv=1925,ms="Musketeer Pirate [Lv. 1925]",q="DeepForestIsland2",n=2,m="Musketeer Pirate",cq=CFrame.new(-12680.38,389.97,-9902.02),cm=CFrame.new(-13282.30,496.24,-9565.15)},
+{lv=1975,ms="Reborn Skeleton [Lv. 1975]",q="HauntedQuest1",n=1,m="Reborn Skeleton",cq=CFrame.new(-9480.83,142.13,5566.07),cm=CFrame.new(-8817.88,191.17,6298.66)},
+{lv=2000,ms="Living Zombie [Lv. 2000]",q="HauntedQuest1",n=2,m="Living Zombie",cq=CFrame.new(-9480.83,142.13,5566.07),cm=CFrame.new(-10125.23,183.95,6242.01)},
+{lv=2025,ms="Demonic Soul [Lv. 2025]",q="HauntedQuest2",n=1,m="Demonic Soul",cq=CFrame.new(-9516.99,178.01,6078.47),cm=CFrame.new(-9712.03,204.70,6193.32)},
+{lv=2050,ms="Posessed Mummy [Lv. 2050]",q="HauntedQuest2",n=2,m="Posessed Mummy",cq=CFrame.new(-9516.99,178.01,6078.47),cm=CFrame.new(-9545.78,69.62,6339.56)},
+{lv=2075,ms="Peanut Scout [Lv. 2075]",q="PeanutQuest1",n=1,m="Peanut Scout",cq=CFrame.new(-2202.74,15.14,-12354.08),cm=CFrame.new(-2202.74,15.14,-12354.08)},
+{lv=2100,ms="Peanut President [Lv. 2100]",q="PeanutQuest2",n=2,m="Peanut President",cq=CFrame.new(-2202.74,15.14,-12354.08),cm=CFrame.new(-2202.74,15.14,-12354.08)},
+{lv=2125,ms="Ice Cream Chef [Lv. 2125]",q="IceCreamQuest1",n=1,m="Ice Cream Chef",cq=CFrame.new(-730.54,38.35,-12629.50),cm=CFrame.new(-730.54,38.35,-12629.50)},
+{lv=2150,ms="Ice Cream Commander [Lv. 2150]",q="IceCreamQuest2",n=2,m="Ice Cream Commander",cq=CFrame.new(-730.54,38.35,-12629.50),cm=CFrame.new(-730.54,38.35,-12629.50)},
+{lv=2200,ms="Cookie Crafter [Lv. 2200]",q="CakeQuest1",n=1,m="Cookie Crafter",cq=CFrame.new(-383.28,79.44,-12611.50),cm=CFrame.new(-383.28,79.44,-12611.50)},
+{lv=2225,ms="Cake Guard [Lv. 2225]",q="CakeQuest2",n=2,m="Cake Guard",cq=CFrame.new(-383.28,79.44,-12611.50),cm=CFrame.new(-383.28,79.44,-12611.50)},
+{lv=2250,ms="Baking Staff [Lv. 2250]",q="CakeQuest3",n=1,m="Baking Staff",cq=CFrame.new(-383.28,79.44,-12611.50),cm=CFrame.new(-383.28,79.44,-12611.50)},
+{lv=2275,ms="Head Baker [Lv. 2275]",q="CakeQuest4",n=2,m="Head Baker",cq=CFrame.new(-383.28,79.44,-12611.50),cm=CFrame.new(-383.28,79.44,-12611.50)},
+{lv=2300,ms="Cocoa Warrior [Lv. 2300]",q="ChocolateQuest1",n=1,m="Cocoa Warrior",cq=CFrame.new(1000.15,55.19,-12498.60),cm=CFrame.new(1000.15,55.19,-12498.60)},
+{lv=2325,ms="Chocolate Bar Battler [Lv. 2325]",q="ChocolateQuest2",n=2,m="Chocolate Bar Battler",cq=CFrame.new(1000.15,55.19,-12498.60),cm=CFrame.new(1000.15,55.19,-12498.60)},
+{lv=2350,ms="Sweet Thief [Lv. 2350]",q="ChocolateQuest3",n=1,m="Sweet Thief",cq=CFrame.new(1000.15,55.19,-12498.60),cm=CFrame.new(1000.15,55.19,-12498.60)},
+{lv=2375,ms="Candy Rebel [Lv. 2375]",q="ChocolateQuest4",n=2,m="Candy Rebel",cq=CFrame.new(1000.15,55.19,-12498.60),cm=CFrame.new(1000.15,55.19,-12498.60)},
+{lv=2400,ms="Candy Pirate [Lv. 2400]",q="CandyQuest1",n=1,m="Candy Pirate",cq=CFrame.new(-1435.24,20.08,-12360.70),cm=CFrame.new(-1435.24,20.08,-12360.70)},
+{lv=2425,ms="Snow Demon [Lv. 2425]",q="CandyQuest2",n=2,m="Snow Demon",cq=CFrame.new(-1435.24,20.08,-12360.70),cm=CFrame.new(-1435.24,20.08,-12360.70)},
+{lv=2450,ms="Isle Outlaw [Lv. 2450]",q="TikiQuest1",n=1,m="Isle Outlaw",cq=CFrame.new(-13880.50,60.19,-10885.30),cm=CFrame.new(-13880.50,60.19,-10885.30)},
+{lv=2475,ms="Island Boy [Lv. 2475]",q="TikiQuest2",n=2,m="Island Boy",cq=CFrame.new(-13880.50,60.19,-10885.30),cm=CFrame.new(-13880.50,60.19,-10885.30)},
+{lv=2500,ms="Sun-kissed Warrior [Lv. 2500]",q="TikiQuest3",n=1,m="Sun-kissed Warrior",cq=CFrame.new(-13880.50,60.19,-10885.30),cm=CFrame.new(-13880.50,60.19,-10885.30)},
+{lv=2525,ms="Isle Champion [Lv. 2525]",q="TikiQuest4",n=2,m="Isle Champion",cq=CFrame.new(-13880.50,60.19,-10885.30),cm=CFrame.new(-13880.50,60.19,-10885.30)},
+{lv=2550,ms="Serpent Hunter [Lv. 2550]",q="TikiQuest5",n=1,m="Serpent Hunter",cq=CFrame.new(-13880.50,60.19,-10885.30),cm=CFrame.new(-13880.50,60.19,-10885.30)},
+{lv=2575,ms="Skull Slayer [Lv. 2575]",q="TikiQuest6",n=2,m="Skull Slayer",cq=CFrame.new(-13880.50,60.19,-10885.30),cm=CFrame.new(-13880.50,60.19,-10885.30)},
+{lv=2600,ms="Reef Bandit [Lv. 2600]",q="SubmergedQuest1",n=1,m="Reef Bandit",cq=CFrame.new(-13900,60,-12000),cm=CFrame.new(-13900,60,-12000)},
+{lv=2625,ms="Coral Pirate [Lv. 2625]",q="SubmergedQuest2",n=2,m="Coral Pirate",cq=CFrame.new(-13900,60,-12000),cm=CFrame.new(-13900,60,-12000)},
+{lv=2650,ms="Sea Chanter [Lv. 2650]",q="SubmergedQuest3",n=1,m="Sea Chanter",cq=CFrame.new(-13900,60,-12000),cm=CFrame.new(-13900,60,-12000)},
+{lv=2675,ms="High Disciple [Lv. 2675]",q="SubmergedQuest4",n=2,m="High Disciple",cq=CFrame.new(-13900,60,-12000),cm=CFrame.new(-13900,60,-12000)},
+}
+for _,q in ipairs(Q) do q.b=q.ms:gsub(" %[Lv%. %d+%]","") if q.lv<700 then q.s=1 elseif q.lv<1500 then q.s=2 else q.s=3 end end
+local function getQuest(lvl,sea)
+    local best,first=nil,nil
+    for _,q in ipairs(Q) do if q.s==sea then first=first or q if lvl>=q.lv then best=q else break end end end
+    return best or first
+end
+
+-- MATERIAL / BOSS / ISLAND / EVENTS
+local MATS={
+["Leather"]={{s=1,m="Pirate",p=CFrame.new(-1219.32,4.75,3915.63)},{s=3,m="Forest Pirate",p=CFrame.new(-13225.81,428.19,-7753.12)}},
+["Scrap Metal"]={{s=1,m="Brute",p=CFrame.new(-1146.50,96.09,4312.13)},{s=3,m="Jungle Pirate",p=CFrame.new(-11982.22,376.33,-10451.42)}},
+["Magma Ore"]={{s=1,m="Military Spy",p=CFrame.new(-5787.99,120.86,8762.25)},{s=2,m="Lava Pirate",p=CFrame.new(-5169.72,34.12,-4669.74)}},
+["Bones"]={{s=1,m="Prisoner",p=CFrame.new(5311,146.4,-4940)}},
+["Angel Wings"]={{s=1,m="Royal Soldier",p=CFrame.new(-7864.45,5661.94,-1708.22)}},
+["Fish Tail"]={{s=1,m="Fishman Warrior",p=CFrame.new(61163.85,5.31,1819.78)},{s=3,m="Fishman Captain",p=CFrame.new(-11194.54,442.03,-8608.81)}},
+["Vampire Fang"]={{s=2,m="Vampire",p=CFrame.new(-6030.32,6.44,-1313.56)}},
+["Mystic Droplet"]={{s=2,m="Water Fighter",p=CFrame.new(-3436.77,290.52,-10503.44)}},
+["Radioactive Material"]={{s=2,m="Factory Staff",p=CFrame.new(-507.7,72.9,-126.4)}},
+["Dragon Scale"]={{s=3,m="Dragon Crew Warrior",p=CFrame.new(6242.00,51.52,-1243.98)}},
+["Conjured Cocoa"]={{s=3,m="Chocolate Bar Battler",p=CFrame.new(1000.15,55.19,-12498.60)}},
+["Demonic Wisp"]={{s=3,m="Demonic Soul",p=CFrame.new(-9712.03,204.70,6193.32)}},
+["Gunpowder"]={{s=3,m="Pistol Billionaire",p=CFrame.new(81.16,43.76,5724.70)}},
+["Mini Tusk"]={{s=3,m="Mythological Pirate",p=CFrame.new(-13869.17,564.95,-7084.41)}},
+}
+local function matFor(n)
+    local l=MATS[n] if not l then return nil end
+    for _,e in ipairs(l) do if e.s==SEA then return e end end
+    return l[1],false
+end
+
+local Bosses={
+{n="The Saw",s=1},{n="Bobby",s=1},{n="Yeti",s=1},{n="Mob Leader",s=1},{n="Vice Admiral",s=1},
+{n="Saber Expert",s=1},{n="Warden",s=1},{n="Chief Warden",s=1},{n="Swan",s=1},{n="Magma Admiral",s=1},
+{n="Fishman Lord",s=1},{n="Wysper",s=1},{n="Thunder God",s=1},{n="Cyborg",s=1},{n="Greybeard",s=1},
+{n="Diamond",s=2},{n="Jeremy",s=2},{n="Fajita",s=2},{n="Don Swan",s=2},{n="Smoke Admiral",s=2},
+{n="Cursed Captain",s=2},{n="Awakened Ice Admiral",s=2},{n="Tide Keeper",s=2},{n="Darkbeard",s=2},{n="Order",s=2},
+{n="Stone",s=3},{n="Island Empress",s=3},{n="Kilo Admiral",s=3},{n="Captain Elephant",s=3},{n="Beautiful Pirate",s=3},
+{n="Longma",s=3},{n="rip_indra",s=3},{n="Soul Reaper",s=3},{n="Cake Prince",s=3},{n="Dough King",s=3},
+{n="Terrorshark",s=3},{n="Leviathan",s=3},{n="Tyrant of the Skies",s=3},
+}
+local Islands={
+{n="Starter Island",p=CFrame.new(1061,16,1544)},{n="Jungle",p=CFrame.new(-1604,36,154)},
+{n="Pirate Village",p=CFrame.new(-1139,4,3825)},{n="Desert",p=CFrame.new(897,6,4388)},
+{n="Frozen Village",p=CFrame.new(1384,87,-1297)},{n="Marine Fortress",p=CFrame.new(-5035,28,4325)},
+{n="Skylands",p=CFrame.new(-4841,717,-2623)},{n="Colosseum",p=CFrame.new(-1576,7,-2983)},
+{n="Prison",p=CFrame.new(5311,146,-4940)},{n="Magma Village",p=CFrame.new(-5316,12,8517)},
+{n="Underwater City",p=CFrame.new(61122,18,1568)},{n="Upper Skylands",p=CFrame.new(-7902,5635,-1411)},
+{n="Fountain City",p=CFrame.new(5254,38,4049)},{n="Kingdom of Rose",p=CFrame.new(-424,73,1836)},
+{n="Green Zone",p=CFrame.new(-2442,73,-3219)},{n="Graveyard",p=CFrame.new(-5492,48,-793)},
+{n="Snow Mountain",p=CFrame.new(604,401,-5371)},{n="Hot and Cold",p=CFrame.new(-5431,15,-5296)},
+{n="Cursed Ship",p=CFrame.new(923,125,-12200)},{n="Ice Castle",p=CFrame.new(5669,28,-6482)},
+{n="Forgotten Island",p=CFrame.new(-3052,236,-10148)},{n="Port Town",p=CFrame.new(-290,42,5581)},
+{n="Hydra Valley",p=CFrame.new(5832,51,-1101)},{n="Great Tree",p=CFrame.new(2180,27,-6741)},
+{n="Floating Turtle",p=CFrame.new(-10581,330,-8761)},{n="Haunted Castle",p=CFrame.new(-9480,142,5566)},
+{n="Peanut Land",p=CFrame.new(-2202,15,-12354)},{n="Ice Cream Land",p=CFrame.new(-730,38,-12629)},
+{n="Cake Land",p=CFrame.new(-383,79,-12611)},{n="Chocolate Land",p=CFrame.new(1000,55,-12498)},
+{n="Candy Cane Land",p=CFrame.new(-1435,20,-12360)},{n="Tiki Outpost",p=CFrame.new(-13880,60,-10885)},
+}
+local SeaEvents={"Sea Beast","Terrorshark","Leviathan","Mirage Island","Kitsune Island","Frozen Dimension","Ship Raid","Pirate Raid","Rumbling Waters"}
+
+-- STATE
+local S={
+AutoFarm=false,AutoMastery=false,FarmH=25,Weapon="Combat",Magnet=true,
+AutoMat=false,SelMat="Leather",AutoBone=false,AutoChest=false,AutoElite=false,
+AutoStat=false,StatType="Melee",AutoHaki=false,
+AutoBoss=false,SelBoss="Bobby",AutoBossAll=false,
+AutoRaid=false,AutoAwaken=false,Chip="Flame",
+AutoFruit=false,FruitSniper=false,FruitESP=false,
+TrackEvents=false,
+PESP=false,BESP=false,MESP=false,CESP=false,SuperESP=false,
+AimAssist=false,TeamCheck=true,BountyTracker=false,
+AutoClick=false,ClickRate=0.10,BringMobSmart=true,
+AutoHopFruit=false,AutoRestore=false,
+Light=IS_MOB,UIToggle=Enum.KeyCode.RightShift,SelIsland="Starter Island",
+}
+
+-- CORE
+local function getLevel() local d=LP:FindFirstChild("Data") if d then local l=d:FindFirstChild("Level") if l then return l.Value end end return 0 end
+
+local MobCache={}
+local function baseName(n) return (n:gsub(" %[Lv%. %d+%]",""):gsub(" %[Boss%]",""):gsub(" %[Raid Boss%]",""):gsub(" %[Elite Hunter%]","")) end
+task.spawn(function()
+    while true do
+        local t={}
+        local EN=WS:FindFirstChild("Enemies")
+        if EN then
+            for _,v in ipairs(EN:GetChildren()) do
+                local h=v:FindFirstChildOfClass("Humanoid")
+                local p=v:FindFirstChild("HumanoidRootPart") or v:FindFirstChild("Torso")
+                if h and p and h.Health>0 then
+                    t[#t+1]={M=v,HRP=p,H=h,Full=v.Name,N=baseName(v.Name),
+                        Boss=v.Name:find("%[Boss%]")~=nil or v.Name:find("%[Raid Boss%]")~=nil}
+                end
+            end
+        end
+        MobCache=t
+        task.wait(S.Light and 0.5 or 0.3)  -- 0.5s mobile = ít lag hơn
+    end
+end)
+
+local function findMob(name)
+    local h=hrp() if not h then return nil end
+    local best,bd=nil,math.huge
+    for _,m in ipairs(MobCache) do
+        if m.N==name or m.Full==name then
+            local d=(m.HRP.Position-h.Position).Magnitude
+            if d<bd then bd=d best=m end
+        end
+    end
+    return best
+end
+local function findAnyBoss()
+    local h=hrp() if not h then return nil end
+    local best,bd=nil,math.huge
+    for _,m in ipairs(MobCache) do
+        if m.Boss then
+            local d=(m.HRP.Position-h.Position).Magnitude
+            if d<bd then bd=d best=m end
+        end
+    end
+    return best
+end
+local function findNPCModel(pat)
+    local low=pat:lower()
+    for _,v in ipairs(WS:GetChildren()) do
+        if v:IsA("Model") and v.Name:lower():find(low,1,true) then return v end
+    end
+    local M=WS:FindFirstChild("Map")
+    if M then for _,v in ipairs(M:GetChildren()) do if v:IsA("Model") and v.Name:lower():find(low,1,true) then return v end end end
+    return nil
+end
+local function findFruit()
+    for _,t in ipairs(WS:GetChildren()) do
+        if t:IsA("Tool") and t:FindFirstChild("Handle") and t.Name:find("Fruit") then return t end
+    end
+    return nil
+end
+
+-- QUEST GUI
+local function questGui()
+    local pg=LP:FindFirstChild("PlayerGui") if not pg then return nil end
+    local m=pg:FindFirstChild("Main") if not m then return nil end
+    return m:FindFirstChild("Quest")
+end
+local function questVisible() local q=questGui() if not q then return false end return q.Visible==true end
+local function questTitle()
+    local q=questGui() if not q then return "" end
+    local ok,r=pcall(function()
+        local c=q:FindFirstChild("Container") if not c then return "" end
+        local t=c:FindFirstChild("QuestTitle") if not t then return "" end
+        local tt=t:FindFirstChild("Title") if not tt then return "" end
+        return tt.Text
+    end)
+    return ok and r or ""
+end
+local function questProgress()
+    local ttl=questTitle() if ttl=="" then return nil,nil end
+    local cur,max=ttl:match("(%d+)%s*/%s*(%d+)")
+    if cur and max then return tonumber(cur),tonumber(max) end
+    return nil,nil
+end
+local function questCompleted()
+    local cur,max=questProgress() if not cur or not max then return false end
+    if max<=0 then return false end
+    return cur>=max
+end
+
+-- EQUIP + CLICK (chỉ tool:Activate, KHÔNG CaptureController)
+local function equip(name)
+    if not name or name=="" then return end
+    local c=chr() if not c then return end
+    if c:FindFirstChild(name) then return end
+    local bp=LP:FindFirstChild("Backpack") if not bp then return end
+    local t=bp:FindFirstChild(name)
+    if t then pcall(function() local hm=c:FindFirstChildOfClass("Humanoid") if hm then hm:EquipTool(t) end end) end
+end
+local function autoEquip()
+    equip(S.Weapon)
+    local c=chr()
+    if c and not c:FindFirstChildOfClass("Tool") then
+        local bp=LP:FindFirstChild("Backpack")
+        if bp then local t=bp:FindFirstChild("Combat") or bp:FindFirstChildOfClass("Tool") if t then equip(t.Name) end end
+    end
+end
+local lastClick=0
+local function doClick()
+    if tick()-lastClick<0.12 then return end  -- 8 click/sec — đủ đánh, không spam
+    lastClick=tick()
+    pcall(function()
+        local c=chr() if not c then return end
+        local t=c:FindFirstChildOfClass("Tool")
+        if t then
+            t:Activate()
+            if t:FindFirstChild("LeftClickRemote") then
+                t.LeftClickRemote:FireServer(Vector3.new(0,-1,0),1)
+            end
+        end
+    end)
+end
+
+-- BRING MOB (set CFrame trực tiếp, không BodyVelocity, mob không bay lên trời)
+-- Smart mode: chỉ kéo mob cùng tên với quest, giới hạn số lượng theo quest progress
+-- mob = mob object, questName = tên mob quest cần (vd "Bandit"), maxCount = số còn cần
+local broughtMobs={}  -- track các mob đang được bring (để giới hạn count)
+local function bringMob(mob,questName,maxCount)
+    if not mob or not mob.HRP or not mob.H or mob.H.Health<=0 then return false end
+    local h=hrp() if not h then return false end
+    -- Smart Bring Mob: kiểm tra quest name + count limit
+    if S.BringMobSmart and questName then
+        -- Chỉ bring mob đúng loại quest
+        if mob.N ~= questName and mob.Full ~= questName then return false end
+        -- Đếm số mob đã bring cùng loại
+        local count=0
+        for m,_ in pairs(broughtMobs) do
+            if m and m.Parent and m:FindFirstChildOfClass("Humanoid") and m:FindFirstChildOfClass("Humanoid").Health>0 then
+                local mn=baseName(m.Name)
+                if mn==questName then count=count+1 end
+            else
+                broughtMobs[m]=nil  -- cleanup mob chết/rời đi
+            end
+        end
+        -- Giới hạn theo quest count (nếu có)
+        if maxCount and count>=maxCount then return false end
+    end
+    if sethiddenproperty then pcall(function() sethiddenproperty(LP,"SimulationRadius",math.huge) end) end
+    pcall(function() mob.HRP:SetNetworkOwner(LP) end)
+    if mob.HRP.Size.X<35 then pcall(function() mob.HRP.Size=Vector3.new(35,35,35) end) end
+    pcall(function() mob.HRP.CanCollide=false end)
+    local lv=h.CFrame.LookVector
+    local fl=Vector3.new(lv.X,0,lv.Z)
+    if fl.Magnitude<0.01 then fl=Vector3.new(0,0,-1) end
+    fl=fl.Unit
+    -- Vị trí mob: trước mặt player, nhưng offset nhẹ theo count để mob không chồng nhau
+    local offset=#broughtMobs*1.5
+    local tgt=Vector3.new(h.Position.X+fl.X*(4+offset),h.Position.Y,h.Position.Z+fl.Z*(4+offset))
+    pcall(function() mob.HRP.CFrame=CFrame.new(tgt) mob.HRP.Velocity=Vector3.zero end)
+    broughtMobs[mob.M]=true
+    return true
+end
+-- Helper: clear broughtMobs table (không reassign local)
+local function clearBroughtMobs()
+    for k in pairs(broughtMobs) do broughtMobs[k]=nil end
+end
+
+-- Cleanup broughtMobs định kỳ (gọi từ AF loop)
+local function cleanupBroughtMobs()
+    for m,_ in pairs(broughtMobs) do
+        if not m or not m.Parent then
+            broughtMobs[m]=nil
+        else
+            local h=m:FindFirstChildOfClass("Humanoid")
+            if not h or h.Health<=0 then broughtMobs[m]=nil end
+        end
+    end
+end
+
+local function attackMob(mob,questName,maxCount)
+    if not mob or not mob.HRP or not mob.H or mob.H.Health<=0 then return end
+    if S.Magnet then
+        bringMob(mob,questName,maxCount)
+    else
+        local h=hrp() if h then
+            local tgt=mob.HRP.CFrame*CFrame.new(0,S.FarmH,8)
+            tgt=CFrame.new(tgt.X,math.max(tgt.Y,h.Position.Y-5),tgt.Z)
+            toTarget(tgt,400)
+        end
+    end
+    autoEquip() doClick()
+end
+
+-- Auto Click đã được gộp vào AF:StartClick() — không cần module riêng nữa
+
+-- ===== ESP MODULE SIÊU XA (khai báo trước để EVT dùng được) =====
+-- Khi SuperESP on: set SimulationRadius=huge (load mob toàn server),
+--                  BillboardGui MaxDistance=huge (text hiện bất kể khoảng cách)
+--                  Camera FarClipPlane tăng (render xa hơn)
+local ESP={Obj={}}
+
+-- Set SimulationRadius = huge để client load object từ xa vô hạn
+local function enableSuperRender()
+    if sethiddenproperty then
+        pcall(function() sethiddenproperty(LP,"SimulationRadius",math.huge) end)
+    end
+    -- Tăng camera far plane để render object xa
+    pcall(function()
+        if Cam then Cam.FarClipPlane=1e9 end
+    end)
+    -- Lighting: tắt fog để nhìn xa hơn
+    pcall(function()
+        if Light then Light.FogEnd=9e9 end
+    end)
+end
+
+-- Loop giữ SuperESP active (mỗi 10s - server có thể reset)
+local superESPLoop=nil
+local function startSuperESP()
+    if superESPLoop then return end
+    enableSuperRender()
+    superESPLoop=task.spawn(function()
+        while S.SuperESP do
+            enableSuperRender()
+            task.wait(10)
+        end
+    end)
+end
+local function stopSuperESP()
+    if superESPLoop then task.cancel(superESPLoop) superESPLoop=nil end
+end
+
+function ESP:Add(inst,col,txt)
+    if not inst or inst.Parent==nil or self.Obj[inst] then return end
+    local o={H=make("Highlight",{FillColor=col or C.Red,OutlineColor=Color3.new(1,1,1),
+        FillTransparency=0.6,OutlineTransparency=0,DepthMode=Enum.HighlightDepthMode.AlwaysOnTop,Parent=inst})}
+    local p=inst:IsA("Model") and (inst:FindFirstChild("HumanoidRootPart") or inst.PrimaryPart) or inst
+    if p then
+        -- MaxDistance = huge → text hiện bất kể khoảng cách (khi SuperESP on)
+        -- Light Influence = 1 → không bị lighting che
+        local bgProps={Size=UDim2.new(0,200,0,22),StudsOffset=Vector3.new(0,4,0),AlwaysOnTop=true,
+            MaxDistance=math.huge,LightInfluence=1,Parent=p}
+        o.B=make("BillboardGui",bgProps)
+        make("TextLabel",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text=txt or inst.Name,
+            Font=Enum.Font.GothamBold,TextSize=12,TextColor3=col or C.Red,
+            TextStrokeTransparency=0,TextStrokeColor3=Color3.new(0,0,0),Parent=o.B})
+    end
+    self.Obj[inst]={o=o}
+end
+function ESP:Rem(inst)
+    local e=self.Obj[inst] if not e then return end
+    pcall(function() if e.o.H then e.o.H:Destroy() end if e.o.B then e.o.B:Destroy() end end)
+    self.Obj[inst]=nil
+end
+function ESP:Clear() for i in pairs(self.Obj) do self:Rem(i) end end
+local espLoop=nil
+local function espStart()
+    if espLoop then return end
+    -- Nếu SuperESP on → set render ngay
+    if S.SuperESP then startSuperESP() end
+    espLoop=task.spawn(function()
+        while true do
+            pcall(function()
+                if S.PESP then
+                    for _,p in ipairs(Players:GetPlayers()) do
+                        if p~=LP and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                            local ls=p:FindFirstChild("leaderstats")
+                            local bn=ls and ls:FindFirstChild("Bounty")
+                            local h=hrp()
+                            local d=h and math.floor((p.Character.HumanoidRootPart.Position-h.Position).Magnitude) or 0
+                            local txt=p.Name..(bn and bn.Value>0 and (" | "..bn.Value.." Beli") or "").." | "..d.."m"
+                            ESP:Add(p.Character,C.Blue,txt)
+                            local e=ESP.Obj[p.Character]
+                            if e and e.o.B and e.o.B:FindFirstChildOfClass("TextLabel") then e.o.B:FindFirstChildOfClass("TextLabel").Text=txt end
+                        end
+                    end
+                end
+                if S.BESP then
+                    -- Khi SuperESP: scan trực tiếp WS.Enemies (bypass MobCache distance filter)
+                    if S.SuperESP then
+                        local EN=WS:FindFirstChild("Enemies")
+                        if EN then
+                            for _,v in ipairs(EN:GetChildren()) do
+                                local h=v:FindFirstChildOfClass("Humanoid")
+                                if h and h.Health>0 and (v.Name:find("%[Boss%]") or v.Name:find("%[Raid Boss%]")) then
+                                    ESP:Add(v,C.Red,baseName(v.Name))
+                                end
+                            end
+                        end
+                    else
+                        for _,m in ipairs(MobCache) do if m.Boss then ESP:Add(m.M,C.Red,m.Full) end end
+                    end
+                end
+                if S.MESP then
+                    -- SuperESP on: không giới hạn cap, scan toàn bộ Enemies
+                    if S.SuperESP then
+                        local EN=WS:FindFirstChild("Enemies")
+                        if EN then
+                            for _,v in ipairs(EN:GetChildren()) do
+                                local h=v:FindFirstChildOfClass("Humanoid")
+                                local p=v:FindFirstChild("HumanoidRootPart")
+                                if h and p and h.Health>0 and not (v.Name:find("%[Boss%]") or v.Name:find("%[Raid Boss%]")) then
+                                    ESP:Add(v,C.Green,baseName(v.Name))
+                                end
+                            end
+                        end
+                    else
+                        local n=0 local cap=S.Light and 10 or 20
+                        for _,m in ipairs(MobCache) do if n<cap then ESP:Add(m.M,C.Green,m.N) n=n+1 end end
+                    end
+                end
+                if S.CESP then
+                    local CM=WS:FindFirstChild("ChestModels")
+                    if CM then for _,c in ipairs(CM:GetChildren()) do ESP:Add(c,C.Yellow,"Chest: "..c.Name) end end
+                end
+                if S.FruitESP then
+                    local h=hrp()
+                    for _,t in ipairs(WS:GetChildren()) do
+                        if t:IsA("Tool") and t.Name:find("Fruit") then
+                            local short,emoji=parseFruit(t.Name)
+                            local dist=h and t:FindFirstChild("Handle") and math.floor((t.Handle.Position-h.Position).Magnitude) or 0
+                            local txt=emoji.." "..short.." | "..dist.."m"
+                            ESP:Add(t,C.Green,txt)
+                            local e=ESP.Obj[t]
+                            if e and e.o.B then local lbl=e.o.B:FindFirstChildOfClass("TextLabel") if lbl then lbl.Text=txt end end
+                        end
+                    end
+                end
+                for i in pairs(ESP.Obj) do if i.Parent==nil then ESP:Rem(i) end end
+            end)
+            task.wait(S.Light and 3 or 2)
+        end
+    end)
+end
+local function espStopIfIdle()
+    if not (S.PESP or S.BESP or S.MESP or S.CESP or S.FruitESP or S.TrackEvents) then
+        ESP:Clear()
+        stopSuperESP()
+    end
+end
+
+-- ===== AUTO FARM ALL-IN-ONE (gộp Bring Mob + Magnet + Auto Click vào 1 toggle) =====
+-- Khi user bật Auto Farm → tự động enable:
+--   - Smart Bring Mob (kéo quái đúng loại quest)
+--   - Magnet Quái (hitbox to)
+--   - Auto Click (tự click liên tục theo rate)
+--   - Auto Haki Buso (nếu chưa bật)
+--   - Auto Stat (nếu có points dư)
+-- Khi user tắt Auto Farm → tự động disable all
+-- User chỉ cần 1 toggle!
+local AF={Loop=nil,Fail=0,Hint=0,AutoClickLoop=nil}
+
+function AF:Stop()
+    if self.Loop then task.cancel(self.Loop) self.Loop=nil end
+    if self.AutoClickLoop then task.cancel(self.AutoClickLoop) self.AutoClickLoop=nil end
+    stopMove()
+    clearBroughtMobs()
+end
+
+-- Sub-loop: Auto Click (chạy song song với Auto Farm)
+function AF:StartClick()
+    if self.AutoClickLoop then return end
+    self.AutoClickLoop=task.spawn(function()
+        while S.AutoFarm do
+            pcall(function()
+                autoEquip()
+                local c=chr()
+                if c then
+                    local t=c:FindFirstChildOfClass("Tool")
+                    if t then
+                        t:Activate()
+                        if t:FindFirstChild("LeftClickRemote") then
+                            t.LeftClickRemote:FireServer(Vector3.new(0,-1,0),1)
+                        end
+                    end
+                end
+            end)
+            task.wait(S.ClickRate)
+        end
+    end)
+end
+
+function AF:StartFarm()
+    self:Stop()
+    -- Tự động bật các chế độ phụ (Smart Bring + Magnet + Click) — không cần toggle riêng
+    S.BringMobSmart=true
+    S.Magnet=true
+    notify("Auto Farm","Đã BẬT! Tự động hoàn toàn:\n• Quét level → nhận quest\n• Bring mob đúng loại\n• Click liên tục\n• Magnet quái\n• Auto Haki Buso (nếu chưa bật)",5)
+    -- Bật Auto Click song song
+    self:StartClick()
+    -- Bật Auto Haki nếu user chưa bật từ Misc
+    if not S.AutoHaki then
+        S.AutoHaki=true
+        self.HakiWasOff=true  -- nhớ để tắt lại khi Auto Farm off
+        AH:Start()
+    else
+        self.HakiWasOff=false
+    end
+    self.Loop=task.spawn(function()
+        while S.AutoFarm do
+            pcall(function()
+                if not chr() then return end
+                -- Cleanup mob đã chết
+                cleanupBroughtMobs()
+                local lvl=getLevel()
+                if tick()-self.Hint>30 then
+                    if SEA==1 and lvl>=700 then notify("Auto Farm","Bạn Lv "..lvl.." — nên sang Sea 2 (tab Misc)",5) self.Hint=tick() end
+                    if SEA==2 and lvl>=1500 then notify("Auto Farm","Bạn Lv "..lvl.." — nên sang Sea 3 (tab Misc)",5) self.Hint=tick() end
+                end
+                -- Tự quét level → chọn quest phù hợp với sea hiện tại
+                local qd=getQuest(lvl,SEA) or getQuest(0,SEA)
+                -- Quest đã xong → abandon để nhận quest mới cùng level
+                if questVisible() and questCompleted() then
+                    INV("AbandonQuest")
+                    clearBroughtMobs()
+                    task.wait(0.4)
+                    return
+                end
+                if not questVisible() then
+                    if self.Fail>=3 then
+                        -- Fallback: farm thường không cần quest
+                        local mob=findMob(qd.b)
+                        if mob then attackMob(mob,qd.b,nil) else toTarget(qd.cm,300) end
+                        return
+                    end
+                    local h=hrp() if not h then return end
+                    -- Bay tới NPC nhận quest
+                    if (h.Position-qd.cq.Position).Magnitude>14 then
+                        toTarget(qd.cq*CFrame.new(0,0,4),320) return
+                    end
+                    -- Nhận quest
+                    stopMove()
+                    INV("SetSpawnPoint")
+                    INV("StartQuest",qd.q,qd.n)
+                    task.wait(0.6)
+                    if not questVisible() then
+                        self.Fail=self.Fail+1
+                        if self.Fail==3 then notify("Auto Farm","Quest lỗi — chuyển sang farm thường",4) end
+                    else
+                        self.Fail=0
+                        notify("Auto Farm","Đã nhận quest: "..qd.b,3)
+                    end
+                else
+                    -- Đang có quest
+                    self.Fail=0
+                    local ttl=questTitle()
+                    -- Quest sai loại quái → abandon để nhận lại
+                    if ttl~="" and not ttl:find(qd.m,1,true) then
+                        INV("AbandonQuest")
+                        clearBroughtMobs()
+                        task.wait(0.3)
+                        return
+                    end
+                    -- Tính số quái còn cần = max - cur
+                    local cur,max=questProgress()
+                    local need = max and math.max(0, max - (cur or 0)) or nil
+                    -- Tìm mob đúng loại quest
+                    local mob=findMob(qd.b)
+                    if mob then
+                        -- Bring mob đúng loại + giới hạn theo quest count
+                        -- (Click đã lo bởi AutoClickLoop song song)
+                        attackMob(mob,qd.b,need)
+                    else
+                        -- Mob không có → bay tới spawn point của mob đó
+                        toTarget(qd.cm,320)
+                    end
+                end
+            end)
+            task.wait(S.Light and 0.25 or 0.15)
+        end
+        -- Khi tắt Auto Farm: dừng click loop + clear mob tracking
+        if self.AutoClickLoop then task.cancel(self.AutoClickLoop) self.AutoClickLoop=nil end
+        stopMove()
+        clearBroughtMobs()
+        -- Tắt Auto Haki chỉ nếu script tự bật (HakiWasOff=true)
+        if self.HakiWasOff and S.AutoHaki then
+            S.AutoHaki=false
+            AH:Stop()
+        end
+    end)
+end
+function AF:RunGeneric(fn)
+    self:Stop()
+    self.Loop=task.spawn(function()
+        while true do
+            pcall(function()
+                if not chr() then return end
+                local t=fn()
+                if t then if t.m then attackMob(t.m) elseif t.p then toTarget(t.p,320) end end
+            end)
+            task.wait(S.Light and 0.25 or 0.15)
+        end
+    end)
+end
+function AF:StartMastery()
+    self:RunGeneric(function()
+        local qd=getQuest(getLevel(),SEA) or getQuest(0,SEA)
+        local mob=findMob(qd.b)
+        if mob then return {m=mob} end
+        return {p=qd.cm}
+    end)
+end
+function AF:StartMat()
+    self:RunGeneric(function()
+        local e=matFor(S.SelMat)
+        if e then local mob=findMob(e.m) if mob then return {m=mob} end return {p=e.p} end
+        return nil
+    end)
+end
+function AF:StartBone()
+    self:RunGeneric(function()
+        local mob=findMob("Reborn Skeleton") or findMob("Living Zombie") or findMob("Demonic Soul") or findMob("Posessed Mummy")
+        if mob then return {m=mob} end
+        local qd=getQuest(2025,3) or getQuest(0,3)
+        return {p=qd.cm}
+    end)
+end
+function AF:StartChest()
+    self:RunGeneric(function()
+        local h=hrp() if not h then return nil end
+        local best,bd=nil,math.huge
+        local CM=WS:FindFirstChild("ChestModels")
+        if CM then
+            for _,c in ipairs(CM:GetChildren()) do
+                local p=c:IsA("BasePart") and c or c:FindFirstChildWhichIsA("BasePart")
+                if p then local d=(p.Position-h.Position).Magnitude if d<bd then bd=d best=p end end
+            end
+        end
+        if best then return {p=best.CFrame*CFrame.new(0,2,0)} end
+        return nil
+    end)
+end
+local ELI_NPC=CFrame.new(-5418.89,313.74,-2826.23)
+function AF:StartElite()
+    self:Stop()
+    if SEA~=3 then notify("Elite","Elite Hunter chỉ có ở Sea 3 (Floating Turtle)",5) end
+    self.Loop=task.spawn(function()
+        while S.AutoElite do
+            pcall(function()
+                if not chr() then return end
+                local h=hrp() if not h then return end
+                local mob=findMob("Diablo") or findMob("Deandre") or findMob("Urban")
+                if not mob then for _,m in ipairs(MobCache) do if m.Full:find("Elite") or m.N:find("Elite") then mob=m break end end end
+                if mob then attackMob(mob)
+                elseif not questVisible() then
+                    if (h.Position-ELI_NPC.Position).Magnitude>14 then toTarget(ELI_NPC*CFrame.new(0,0,4),320)
+                    else INV("EliteHunter") task.wait(0.5) end
+                else toTarget(ELI_NPC*CFrame.new(0,40,0),320) end
+            end)
+            task.wait(0.2)
+        end
+        stopMove()
+    end)
+end
+local function afRestart()
+    if S.AutoFarm then AF:StartFarm()
+    elseif S.AutoMastery then AF:StartMastery()
+    elseif S.AutoMat then AF:StartMat()
+    elseif S.AutoBone then AF:StartBone()
+    elseif S.AutoChest then AF:StartChest()
+    elseif S.AutoElite then AF:StartElite()
+    else AF:Stop() end
+end
+
+-- ===== BOSS / RAID / AWAKEN / FRUIT / HAKI / STAT / AIM / BOUNTY / EVENTS =====
+local BF={Loop=nil,Hint=0}
+function BF:Stop() if BF.Loop then task.cancel(BF.Loop) BF.Loop=nil end stopMove() end
+function BF:Start(name,all)
+    self:Stop()
+    BF.Loop=task.spawn(function()
+        while true do
+            pcall(function()
+                if not chr() then return end
+                local mob
+                if all then mob=findAnyBoss()
+                else
+                    mob=findMob(name)
+                    if not mob then
+                        local bb=nil for _,b in ipairs(Bosses) do if b.n==name then bb=b break end end
+                        if bb and bb.s~=SEA and tick()-self.Hint>30 then
+                            self.Hint=tick() notify("Boss",name.." ở Sea "..bb.s.." — dùng Misc để chuyển biển",4)
+                        end
+                        stopMove() return
+                    end
+                end
+                if mob then attackMob(mob) else stopMove() end
+            end)
+            task.wait(0.15)
+        end
+    end)
+end
+
+local RD={Loop=nil,BuyT=0,SelT=0,FireT=0}
+function RD:Stop() if RD.Loop then task.cancel(RD.Loop) RD.Loop=nil end stopMove() end
+local function inRaid()
+    local pg=LP:FindFirstChild("PlayerGui") if not pg then return false end
+    local m=pg:FindFirstChild("Main") if not m then return false end
+    local t=m:FindFirstChild("Timer")
+    if t and t.Visible==true then return true end
+    local WO=WS:FindFirstChild("_WorldOrigin")
+    return WO and WO:FindFirstChild("Locations") and WO.Locations:FindFirstChild("Island 1")~=nil
+end
+local function hasChip()
+    local bp=LP:FindFirstChild("Backpack") local c=chr() local n="Special Microchip"
+    return (bp and bp:FindFirstChild(n)) or (c and c:FindFirstChild(n))
+end
+local function summonBtn()
+    local M=WS:FindFirstChild("Map") if not M then return nil end
+    local isl=M:FindFirstChild("CircleIsland") or M:FindFirstChild("Boat Castle") if not isl then return nil end
+    local rs=isl:FindFirstChild("RaidSummon2") if not rs then return nil end
+    local bb=rs:FindFirstChild("Button") if not bb then return nil end
+    local main=bb:FindFirstChild("Main")
+    if main then return main:FindFirstChild("ClickDetector") end
+    return bb:FindFirstChildOfClass("ClickDetector")
+end
+function RD:Start()
+    RD:Stop()
+    if SEA==1 then notify("Raid","Raid chỉ có ở Sea 2/3 — dùng Misc để chuyển biển!",5) end
+    RD.Loop=task.spawn(function()
+        while S.AutoRaid do
+            pcall(function()
+                if not chr() then return end
+                if inRaid() then
+                    local h=hrp() if not h then return end
+                    local RM=WS:FindFirstChild("Map") and WS.Map:FindFirstChild("RaidMap")
+                    if RM then for i=5,1,-1 do local isl=RM:FindFirstChild("RaidIsland"..i)
+                        if isl then local pp=isl:FindFirstChildWhichIsA("BasePart")
+                            if pp and (pp.Position-h.Position).Magnitude>30 then toTarget(pp.CFrame*CFrame.new(0,20,0),400) end
+                            break end end end
+                    local best,bd=nil,math.huge
+                    for _,m in ipairs(MobCache) do local d=(m.HRP.Position-h.Position).Magnitude if d<bd then bd=d best=m end end
+                    if best then attackMob(best) end
+                else
+                    if not hasChip() then
+                        local h=hrp()
+                        local sci=findNPCModel("Scientist")
+                        local pp=sci and (sci.PrimaryPart or sci:FindFirstChildWhichIsA("BasePart"))
+                        if pp and h then
+                            if (pp.Position-h.Position).Magnitude>12 then toTarget(pp.CFrame*CFrame.new(0,2,4),350)
+                            elseif tick()-self.BuyT>2 then self.BuyT=tick() INV("Cousin","Buy") end
+                        elseif tick()-self.BuyT>2 then self.BuyT=tick() INV("Cousin","Buy") end
+                    else
+                        if tick()-self.SelT>5 then self.SelT=tick() INV("RaidsNpc","Select",S.Chip) end
+                        if tick()-self.FireT>2.5 then
+                            self.FireT=tick()
+                            pcall(function() local cd=summonBtn() if cd and fireclickdetector then fireclickdetector(cd) end end)
+                        end
+                    end
+                end
+            end)
+            task.wait(0.3)
+        end
+        stopMove()
+    end)
+end
+
+local AW={Loop=nil}
+function AW:Stop() if AW.Loop then task.cancel(AW.Loop) AW.Loop=nil end stopMove() end
+function AW:Start()
+    AW:Stop()
+    AW.Loop=task.spawn(function()
+        while S.AutoAwaken do
+            pcall(function()
+                if not inRaid() then
+                    local M=WS:FindFirstChild("Map")
+                    if M and M:FindFirstChild("RaidMap") then
+                        local RM=M.RaidMap
+                        for i=5,1,-1 do local isl=RM:FindFirstChild("RaidIsland"..i)
+                            if isl then local pp=isl:FindFirstChildWhichIsA("BasePart")
+                                if pp then toTarget(pp.CFrame*CFrame.new(0,5,0),400) end
+                                break end end
+                    end
+                    INV("Awakener","Check") INV("Awakener","Awaken")
+                end
+            end)
+            task.wait(1.5)
+        end
+        stopMove()
+    end)
+end
+
+local FT={Loop=nil,Last=nil}
+function FT:Stop() if FT.Loop then task.cancel(FT.Loop) FT.Loop=nil end stopMove() end
+function FT:Start()
+    FT:Stop()
+    FT.Loop=task.spawn(function()
+        while S.AutoFruit or S.FruitSniper do
+            pcall(function()
+                local f=findFruit()
+                if f then
+                    if S.FruitSniper and f.Name~=FT.Last then
+                        FT.Last=f.Name
+                        local short,emoji=parseFruit(f.Name)
+                        notify("FRUIT SNIPER",emoji.." "..short.." xuất hiện!",5)
+                    end
+                    if S.AutoFruit then toTarget(f.Handle.CFrame,450) end
+                else FT.Last=nil end
+            end)
+            task.wait(0.5)
+        end
+        stopMove()
+    end)
+end
+
+local AH={Loop=nil}
+function AH:Stop() if AH.Loop then task.cancel(AH.Loop) AH.Loop=nil end end
+function AH:Start()
+    AH:Stop()
+    AH.Loop=task.spawn(function()
+        while S.AutoHaki do pcall(function() INV("Buso") end) task.wait(8) end
+    end)
+end
+
+local AS={Loop=nil}
+function AS:Stop() if AS.Loop then task.cancel(AS.Loop) AS.Loop=nil end end
+function AS:Start()
+    AS:Stop()
+    AS.Loop=task.spawn(function()
+        while S.AutoStat do
+            pcall(function()
+                local d=LP:FindFirstChild("Data")
+                if d then local p=d:FindFirstChild("Points")
+                    if p and p.Value>0 then INV("AddPoint",S.StatType,p.Value) end end
+            end)
+            task.wait(1)
+        end
+    end)
+end
+
+local AA={Conn=nil,Tgt=nil,Next=0}
+function AA:Stop() if AA.Conn then AA.Conn:Disconnect() AA.Conn=nil end AA.Tgt=nil end
+function AA:Start()
+    AA:Stop()
+    AA.Conn=RS.RenderStepped:Connect(function()
+        if not S.AimAssist then return end
+        if tick()>AA.Next then
+            AA.Next=tick()+(S.Light and 0.35 or 0.2)
+            local h=hrp() if not h then return end
+            local best,bd=nil,math.huge
+            for _,p in ipairs(Players:GetPlayers()) do
+                if p~=LP and p.Character then
+                    local hh=p.Character:FindFirstChild("Head") or p.Character:FindFirstChild("HumanoidRootPart")
+                    local hm2=p.Character:FindFirstChildOfClass("Humanoid")
+                    if hh and hm2 and hm2.Health>0 then
+                        local skip=false
+                        if S.TeamCheck and LP.Team and p.Team and LP.Team==p.Team then skip=true end
+                        if not skip then
+                            local d=(hh.Position-h.Position).Magnitude
+                            if d<bd and d<500 then bd=d best=hh end
+                        end
+                    end
+                end
+            end
+            AA.Tgt=best
+        end
+        if AA.Tgt and AA.Tgt.Parent then Cam.CFrame=CFrame.lookAt(Cam.CFrame.Position,AA.Tgt.Position) end
+    end)
+end
+
+local BT={Loop=nil}
+function BT:Stop() if BT.Loop then task.cancel(BT.Loop) BT.Loop=nil end end
+function BT:Start()
+    BT:Stop()
+    BT.Loop=task.spawn(function()
+        local seen={}
+        while S.BountyTracker do
+            pcall(function()
+                local h=hrp() if not h then return end
+                for _,p in ipairs(Players:GetPlayers()) do
+                    if p~=LP then
+                        local ls=p:FindFirstChild("leaderstats")
+                        local b=ls and ls:FindFirstChild("Bounty")
+                        if b and b.Value>=250000 then
+                            local d=p.Character and p.Character:FindFirstChild("HumanoidRootPart") and math.floor((p.Character.HumanoidRootPart.Position-h.Position).Magnitude) or 99999
+                            if d<600 and not seen[p.Name] then
+                                seen[p.Name]=true notify("BOUNTY!"," "..p.Name.." ("..b.Value.." Beli) đang ở gần!",5)
+                            elseif d>800 then seen[p.Name]=nil end
+                        end
+                    end
+                end
+            end)
+            task.wait(S.Light and 3 or 2)
+        end
+    end)
+end
+
+local EVT={Loop=nil}
+function EVT:Stop() if EVT.Loop then task.cancel(EVT.Loop) EVT.Loop=nil end end
+local function findEvent(pat)
+    local low=pat:lower()
+    local function scan(c) for _,o in ipairs(c:GetChildren()) do if o:IsA("Model") and o.Name:lower():find(low,1,true) then return o end end end
+    local m=scan(WS) if m then return m end
+    local MP=WS:FindFirstChild("Map") if MP then m=scan(MP) end
+    return m
+end
+function EVT:Start()
+    EVT:Stop()
+    EVT.Loop=task.spawn(function()
+        local seen={}
+        while S.TrackEvents do
+            pcall(function()
+                for _,e in ipairs(SeaEvents) do
+                    local m=findEvent(e)
+                    if m then
+                        if not seen[e] then seen[e]=true notify("SEA EVENT"," "..e.." đang xuất hiện!",6) end
+                        ESP:Add(m,C.Yellow,e)
+                    else seen[e]=nil end
+                end
+            end)
+            task.wait(S.Light and 8 or 5)
+        end
+    end)
+end
+
+-- ===== STATE SAVE/LOAD (lưu trạng thái script - không cần bật lại) =====
+-- Dùng writefile/readfile của executor để lưu state vào file TNThud_State.json
+-- Khi script load: đọc file → tự restore các toggle đã bật
+local STATE_FILE="TNThud_State.json"
+local function saveState()
+    if not writefile then return end
+    pcall(function()
+        -- Lưu các toggle quan trọng (không lưu slider/checkbox phụ)
+        local st={
+            AutoFarm=S.AutoFarm, AutoMastery=S.AutoMastery, AutoMat=S.AutoMat,
+            AutoBone=S.AutoBone, AutoChest=S.AutoChest, AutoElite=S.AutoElite,
+            AutoBoss=S.AutoBoss, AutoBossAll=S.AutoBossAll, SelBoss=S.SelBoss,
+            AutoRaid=S.AutoRaid, AutoAwaken=S.AutoAwaken, Chip=S.Chip,
+            AutoFruit=S.AutoFruit, FruitSniper=S.FruitSniper, FruitESP=S.FruitESP,
+            AutoHopFruit=S.AutoHopFruit,
+            PESP=S.PESP, BESP=S.BESP, MESP=S.MESP, CESP=S.CESP, SuperESP=S.SuperESP,
+            TrackEvents=S.TrackEvents, AutoHaki=S.AutoHaki, AutoStat=S.AutoStat,
+            StatType=S.StatType, SelMat=S.SelMat, Magnet=S.Magnet,
+            AutoClick=S.AutoClick, ClickRate=S.ClickRate,
+            Weapon=S.Weapon, FarmH=S.FarmH, FlySpeed=Fly.Speed,
+            AimAssist=S.AimAssist, BountyTracker=S.BountyTracker, TeamCheck=S.TeamCheck,
+        }
+        writefile(STATE_FILE, HS:JSONEncode(st))
+    end)
+end
+
+local function loadState()
+    if not readfile or not isfile then return nil end
+    local ok, content = pcall(function()
+        if not isfile(STATE_FILE) then return nil end
+        return readfile(STATE_FILE)
+    end)
+    if not ok or not content then return nil end
+    local ok2, st = pcall(function() return HS:JSONDecode(content) end)
+    if not ok2 or type(st) ~= "table" then return nil end
+    return st
+end
+
+local function clearState()
+    if not writefile then return end
+    if isfile and isfile(STATE_FILE) then
+        pcall(function() delfile(STATE_FILE) end)
+    end
+end
+
+-- Hàm lưu state định kỳ (gọi mỗi 5s nếu AutoRestore on)
+local stateSaveLoop=nil
+local function startStateSave()
+    if stateSaveLoop then return end
+    stateSaveLoop=task.spawn(function()
+        while S.AutoRestore do
+            saveState()
+            task.wait(5)
+        end
+    end)
+end
+local function stopStateSave()
+    if stateSaveLoop then task.cancel(stateSaveLoop) stateSaveLoop=nil end
+end
+
+-- ===== AUTO HOP SERVER TÌM TRÁI ÁC QUỶ =====
+-- Khi bật: nếu server hiện tại không có fruit → hop sang server khác
+-- Yêu cầu: executor hỗ trợ queue_on_teleport (để script tự chạy lại sau khi hop)
+-- Sau khi hop: script tự check lại fruit → có thì báo + bay tới, không thì hop tiếp
+local HopFruit={Loop=nil, HopCount=0}
+
+local function queueAutoExec()
+    -- Queue script để tự chạy lại khi teleport (cần Auto Execute trong executor)
+    -- User cần set getgenv().TNT_SCRIPT_URL = "URL_script" trước khi load TNThud
+    -- VD: getgenv().TNT_SCRIPT_URL = "https://pastebin.com/raw/xxx" rồi loadstring(...)
+    if queue_on_teleport then
+        pcall(function()
+            local scriptUrl = getgenv() and getgenv().TNT_SCRIPT_URL
+            if scriptUrl and scriptUrl ~= "" then
+                queue_on_teleport([[loadstring(game:HttpGet("]]..scriptUrl..[["))()]])
+            else
+                -- Không có URL: queue_on_teleport không làm gì (executor tự auto-exec script nếu có Auto Exec)
+                -- User chỉ cần copy script vào Auto Exec folder của executor
+                queue_on_teleport("")
+            end
+        end)
+    end
+end
+
+local function hopToNextServer()
+    local req
+    pcall(function() req = syn and syn.request or request or http_request end)
+    if not req then
+        notify("Hop Fruit","Executor không hỗ trợ HTTP — không thể hop",4)
+        return false
+    end
+    -- Lưu state trước khi hop (nếu AutoRestore on)
+    if S.AutoRestore then saveState() end
+    -- Lưu flag hop mode qua getgenv để script sau khi teleport biết cần hunt fruit
+    if getgenv then
+        getgenv().TNT_HOP_MODE="fruit"
+        getgenv().TNT_HOP_COUNT=(getgenv().TNT_HOP_COUNT or 0)+1
+    end
+    -- Queue script tự chạy lại
+    queueAutoExec()
+    -- Tìm server khác
+    local hopped=false
+    pcall(function()
+        local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"
+        local data=HS:JSONDecode(req({Url=url, Method="GET"}).Body)
+        for _,sv in ipairs(data.data) do
+            if sv.playing<sv.maxPlayers and sv.id~=game.JobId then
+                notify("Hop Fruit","Đang hop tới server khác (lần "..(getgenv().TNT_HOP_COUNT or 0)..")...",3)
+                TPS:TeleportToPlaceInstance(game.PlaceId, sv.id, LP)
+                hopped=true
+                return
+            end
+        end
+    end)
+    return hopped
+end
+
+function HopFruit:Start()
+    if self.Loop then return end
+    notify("Auto Hop Fruit","BẬT! Sẽ tự tìm trái ác quỷ qua nhiều server\n(yêu cầu bật Auto Execute trong executor)",5)
+    self.Loop=task.spawn(function()
+        while S.AutoHopFruit do
+            pcall(function()
+                local f=findFruit()
+                if f and f:FindFirstChild("Handle") then
+                    -- Có fruit → báo + bay tới
+                    local short,emoji=parseFruit(f.Name)
+                    notify("TÌM THẤY!"," "..emoji.." "..short.." ở server này! Đang bay tới...",8)
+                    if not Fly.On then
+                        Fly:GotoTarget(f.Handle.Position)
+                    end
+                    -- Bật Fruit ESP nếu chưa
+                    if not S.FruitESP then
+                        S.FruitESP=true
+                        espStart()
+                    end
+                    -- Clear hop mode
+                    if getgenv then getgenv().TNT_HOP_MODE=nil end
+                    -- Dừng hop (nhưng giữ Auto Hop toggle để user thấy trạng thái)
+                    S.AutoHopFruit=false
+                    return
+                end
+                -- Không có fruit → hop sau 3s
+                task.wait(3)
+                if S.AutoHopFruit then
+                    hopToNextServer()
+                end
+            end)
+            task.wait(2)
+        end
+    end)
+end
+function HopFruit:Stop()
+    if self.Loop then task.cancel(self.Loop) self.Loop=nil end
+    if getgenv then getgenv().TNT_HOP_MODE=nil end
+end
+
+-- ===== MISC =====
+local Misc={}
+Misc.AntiAFK=LP.Idled:Connect(function() pcall(function() VU:CaptureController() VU:ClickButton2(Vector2.new()) end) end)
+local function hopServer()
+    local req pcall(function() req=syn and syn.request or request or http_request end)
+    if not req then notify("Hop","Executor không hỗ trợ HTTP",3) return end
+    pcall(function()
+        local url="https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100"
+        local data=HS:JSONDecode(req({Url=url,Method="GET"}).Body)
+        for _,sv in ipairs(data.data) do
+            if sv.playing<sv.maxPlayers and sv.id~=game.JobId then
+                notify("Hop","Đang chuyển server...",3)
+                if S.AutoRestore then saveState() end
+                queueAutoExec()
+                TPS:TeleportToPlaceInstance(game.PlaceId,sv.id,LP) return
+            end
+        end
+        notify("Hop","Không tìm thấy server khác",3)
+    end)
+end
+function Misc:Rejoin() notify("Rejoin","Đang vào lại server...",3) TPS:Teleport(game.PlaceId,LP) end
+function Misc:FPS()
+    pcall(function()
+        local t=WS.Terrain
+        t.WaterWaveSize=0 t.WaterWaveSpeed=0 t.WaterReflectance=0 t.WaterTransparency=0
+        Light.GlobalShadows=false Light.FogEnd=9e9 Light.Brightness=0
+        settings().Rendering.QualityLevel=Enum.QualityLevel.Level01
+        for _,o in ipairs(WS:GetDescendants()) do
+            if o:IsA("BasePart") then o.Material=Enum.Material.Plastic o.Reflectance=0
+            elseif o:IsA("Decal") or o:IsA("Texture") then o.Transparency=1
+            elseif o:IsA("ParticleEmitter") or o:IsA("Trail") then o.Lifetime=NumberRange.new(0)
+            elseif o:IsA("Fire") or o:IsA("SpotLight") or o:IsA("Smoke") or o:IsA("Sparkles") or o:IsA("Explosion") then o.Enabled=false
+            elseif o:IsA("MeshPart") then o.Material=Enum.Material.Plastic o.Reflectance=0 end
+        end
+        for _,e in ipairs(Light:GetChildren()) do
+            if e:IsA("BlurEffect") or e:IsA("SunRaysEffect") or e:IsA("ColorCorrectionEffect") or e:IsA("BloomEffect") or e:IsA("DepthOfFieldEffect") then e.Enabled=false end
+        end
+    end)
+    notify("FPS Boost","Đã áp dụng!",3)
+end
+
+-- ===== UI (đơn giản, không gradient/animation) =====
+local gui=make("ScreenGui",{Name="TNThud",ResetOnSpawn=false,ZIndexBehavior=Enum.ZIndexBehavior.Sibling,IgnoreGuiInset=true,Parent=getGui()})
+local VP=Cam.ViewportSize
+local W=IS_MOB and math.min(520,VP.X-20) or 660
+local H=IS_MOB and math.min(440,VP.Y-20) or 460
+local main=make("Frame",{Size=UDim2.new(0,W,0,H),Position=UDim2.new(0.5,-W/2,0.5,-H/2),BackgroundColor3=C.Bg,BorderSizePixel=0,Parent=gui})
+corner(main,6)
+local top=make("Frame",{Size=UDim2.new(1,0,0,32),BackgroundColor3=C.Surface,BorderSizePixel=0,Parent=main})
+corner(top,6)
+make("TextLabel",{Size=UDim2.new(0,260,0,20),Position=UDim2.new(0,12,0.5,-10),BackgroundTransparency=1,
+    Text="TNThud v14.0 | Sea "..SEA,Font=Enum.Font.GothamBold,TextSize=13,TextColor3=C.Text,
+    TextXAlignment=Enum.TextXAlignment.Left,Parent=top})
+local closeB=make("TextButton",{Size=UDim2.new(0,24,0,24),Position=UDim2.new(1,-28,0.5,-12),BackgroundColor3=C.Hi,
+    Text="X",Font=Enum.Font.GothamBold,TextSize=12,TextColor3=C.Sub,AutoButtonColor=false,BorderSizePixel=0,Parent=top})
+corner(closeB,4)
+local minB=make("TextButton",{Size=UDim2.new(0,24,0,24),Position=UDim2.new(1,-58,0.5,-12),BackgroundColor3=C.Hi,
+    Text="-",Font=Enum.Font.GothamBold,TextSize=14,TextColor3=C.Sub,AutoButtonColor=false,BorderSizePixel=0,Parent=top})
+corner(minB,4)
+local body=make("Frame",{Size=UDim2.new(1,0,1,-36),Position=UDim2.new(0,0,0,34),BackgroundTransparency=1,Parent=main})
+local side=make("Frame",{Size=UDim2.new(0,110,1,-8),Position=UDim2.new(0,4,0,4),BackgroundColor3=C.Surface,BorderSizePixel=0,Parent=body})
+corner(side,4)
+local mSc=make("ScrollingFrame",{Size=UDim2.new(1,-8,1,-12),Position=UDim2.new(0,4,0,8),BackgroundTransparency=1,
+    BorderSizePixel=0,ScrollBarThickness=2,CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,Parent=side})
+make("UIListLayout",{Padding=UDim.new(0,2),Parent=mSc})
+
+local items={{"Main"},{"Boss"},{"Raid"},{"Fruit"},{"Sea"},{"ESP"},{"TP"},{"PvP"},{"Misc"}}
+local mBtns,pages={},{}
+local content=make("Frame",{Size=UDim2.new(1,-120,1,-8),Position=UDim2.new(0,118,0,4),BackgroundTransparency=1,Parent=body})
+for i,it in ipairs(items) do
+    local b=make("TextButton",{Size=UDim2.new(1,0,0,26),BackgroundColor3=C.Hi,BackgroundTransparency=i==1 and 0 or 1,
+        Text=it[1],Font=Enum.Font.GothamMedium,TextSize=11,TextColor3=i==1 and C.Text or C.Sub,
+        AutoButtonColor=false,BorderSizePixel=0,Parent=mSc})
+    corner(b,4)
+    local pg=make("ScrollingFrame",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,BorderSizePixel=0,
+        ScrollBarThickness=2,CanvasSize=UDim2.new(0,0,0,0),AutomaticCanvasSize=Enum.AutomaticSize.Y,
+        Visible=i==1,Parent=content})
+    make("UIListLayout",{Padding=UDim.new(0,3),Parent=pg})
+    make("UIPadding",{PaddingLeft=UDim.new(0,3),PaddingRight=UDim.new(0,3),PaddingTop=UDim.new(0,3),Parent=pg})
+    b.MouseButton1Click:Connect(function()
+        for _,mb in ipairs(mBtns) do mb.BackgroundTransparency=1 mb.TextColor3=C.Sub end
+        b.BackgroundTransparency=0 b.TextColor3=C.Text
+        for j,p in ipairs(pages) do p.Visible=(j==i) end
+    end)
+    table.insert(mBtns,b) table.insert(pages,pg)
+end
+
+-- UI helpers (đơn giản, không gradient, không animation)
+local function sec(p,t)
+    make("TextLabel",{Size=UDim2.new(1,0,0,20),BackgroundTransparency=1,Text=t,
+        Font=Enum.Font.GothamBold,TextSize=11,TextColor3=C.Primary,
+        TextXAlignment=Enum.TextXAlignment.Left,Parent=p})
+end
+local function lbl(p,t)
+    make("TextLabel",{Size=UDim2.new(1,0,0,14),BackgroundTransparency=1,Text=t,
+        Font=Enum.Font.Gotham,TextSize=9,TextColor3=C.Sub,
+        TextXAlignment=Enum.TextXAlignment.Left,Parent=p})
+end
+local function btn(p,t,cb)
+    local b=make("TextButton",{Size=UDim2.new(1,0,0,28),BackgroundColor3=C.Surface,Text=t,
+        Font=Enum.Font.GothamMedium,TextSize=11,TextColor3=C.Text,AutoButtonColor=false,BorderSizePixel=0,Parent=p})
+    corner(b,4)
+    b.MouseButton1Click:Connect(function()
+        b.BackgroundColor3=C.Primary
+        task.delay(0.1,function() b.BackgroundColor3=C.Surface end)
+        if cb then task.spawn(cb) end
+    end)
+    return b
+end
+local function tog(p,t,def,cb)
+    local st=def or false
+    local c=make("Frame",{Size=UDim2.new(1,0,0,30),BackgroundColor3=C.Surface,BorderSizePixel=0,Parent=p})
+    corner(c,4)
+    make("UIPadding",{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8),Parent=c})
+    make("TextLabel",{Size=UDim2.new(1,-44,1,0),BackgroundTransparency=1,Text=t,
+        Font=Enum.Font.GothamMedium,TextSize=11,TextColor3=C.Text,
+        TextXAlignment=Enum.TextXAlignment.Left,TextWrapped=true,Parent=c})
+    local sw=make("Frame",{Size=UDim2.new(0,34,0,16),Position=UDim2.new(1,-34,0.5,-8),BackgroundColor3=C.Hi,BorderSizePixel=0,Parent=c})
+    corner(sw,8)
+    local kn=make("Frame",{Size=UDim2.new(0,12,0,12),Position=UDim2.new(0,2,0.5,-6),BackgroundColor3=C.Sub,BorderSizePixel=0,Parent=sw})
+    corner(kn,6)
+    local b=make("TextButton",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text="",AutoButtonColor=false,Parent=c})
+    local function set(v)
+        st=v
+        if st then sw.BackgroundColor3=C.Primary kn.Position=UDim2.new(1,-14,0.5,-6) kn.BackgroundColor3=C.Text
+        else sw.BackgroundColor3=C.Hi kn.Position=UDim2.new(0,2,0.5,-6) kn.BackgroundColor3=C.Sub end
+        if cb then task.spawn(cb,st) end
+    end
+    b.MouseButton1Click:Connect(function() set(not st) end)
+    if def then set(true) end
+    return {Set=set}
+end
+local function drop(p,t,opts,def,cb)
+    local cur=def or opts[1]
+    local o=opts
+    local c=make("Frame",{Size=UDim2.new(1,0,0,30),BackgroundColor3=C.Surface,BorderSizePixel=0,Parent=p})
+    corner(c,4)
+    make("UIPadding",{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8),Parent=c})
+    make("TextLabel",{Size=UDim2.new(1,-86,1,0),BackgroundTransparency=1,Text=t,
+        Font=Enum.Font.GothamMedium,TextSize=10,TextColor3=C.Text,
+        TextXAlignment=Enum.TextXAlignment.Left,Parent=c})
+    local lb=make("TextLabel",{Size=UDim2.new(0,78,1,0),Position=UDim2.new(1,-78,0,0),BackgroundTransparency=1,
+        Text=cur,Font=Enum.Font.GothamBold,TextSize=9,TextColor3=C.Primary,
+        TextXAlignment=Enum.TextXAlignment.Right,TextWrapped=true,Parent=c})
+    local b=make("TextButton",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text="",AutoButtonColor=false,Parent=c})
+    b.MouseButton1Click:Connect(function()
+        local i=table.find(o,cur) or 0 i=i%#o+1 cur=o[i] lb.Text=cur
+        if cb then task.spawn(cb,cur) end
+    end)
+    return {Get=function() return cur end,Set=function(v) cur=v lb.Text=v end,SetOpts=function(l) o=l end}
+end
+local function sld(p,t,min,max,def,cb)
+    local v=def or min
+    local c=make("Frame",{Size=UDim2.new(1,0,0,42),BackgroundColor3=C.Surface,BorderSizePixel=0,Parent=p})
+    corner(c,4)
+    make("UIPadding",{PaddingLeft=UDim.new(0,8),PaddingRight=UDim.new(0,8),Parent=c})
+    local lb=make("TextLabel",{Size=UDim2.new(1,0,0,14),BackgroundTransparency=1,Text=t.."  ["..v.."]",
+        Font=Enum.Font.GothamMedium,TextSize=10,TextColor3=C.Text,
+        TextXAlignment=Enum.TextXAlignment.Left,Parent=c})
+    local tr=make("Frame",{Size=UDim2.new(1,0,0,4),Position=UDim2.new(0,0,1,-10),BackgroundColor3=C.Hi,BorderSizePixel=0,Parent=c})
+    corner(tr,2)
+    local fl=make("Frame",{Size=UDim2.new((v-min)/(max-min),0,1,0),BackgroundColor3=C.Primary,BorderSizePixel=0,Parent=tr})
+    corner(fl,2)
+    local dg=false
+    local function upd(x)
+        local r=math.clamp((x-tr.AbsolutePosition.X)/math.max(1,tr.AbsoluteSize.X),0,1)
+        v=math.floor(min+(max-min)*r+0.5)
+        fl.Size=UDim2.new(r,0,1,0) lb.Text=t.."  ["..v.."]"
+        if cb then task.spawn(cb,v) end
+    end
+    local hb=make("TextButton",{Size=UDim2.new(1,0,0,22),Position=UDim2.new(0,0,0,-8),BackgroundTransparency=1,Text="",AutoButtonColor=false,Parent=tr})
+    hb.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dg=true upd(i.Position.X) end end)
+    UIS.InputChanged:Connect(function(i) if dg and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then upd(i.Position.X) end end)
+    UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dg=false end end)
+end
+
+-- ===== TAB 1: MAIN =====
+local p1=pages[1]
+sec(p1,"AUTO FARM (1 toggle - tự động hoàn toàn)")
+tog(p1,"Auto Farm (quét lv + nhận quest + bring mob + click)",false,function(v) S.AutoFarm=v if v then AF:StartFarm() else afRestart() end end)
+sld(p1,"Độ cao khi farm",5,60,S.FarmH,function(v) S.FarmH=v end)
+sld(p1,"Tốc độ click (giây)",0.05,0.5,S.ClickRate,function(v) S.ClickRate=v end)
+lbl(p1,"Bật 1 toggle này là xong! Script tự:")
+lbl(p1,"• Quét level hiện tại của bạn")
+lbl(p1,"• Bay tới NPC nhận quest phù hợp")
+lbl(p1,"• Tìm mob đúng loại + Bring mob về gần bạn")
+lbl(p1,"• Tự click liên tục (theo tốc độ trên)")
+lbl(p1,"• Magnet quái + Auto Haki Buso")
+lbl(p1,"• Khi quest xong → tự nhận quest mới")
+sec(p1,"MASTERY & VŨ KHÍ")
+local wd=drop(p1,"Vũ khí",{"Combat"},"Combat",function(v) S.Weapon=v end)
+btn(p1,"Nạp danh sách vũ khí",function()
+    local names={"Combat"}
+    local bp=LP:FindFirstChild("Backpack") local c=chr()
+    if bp then for _,t in ipairs(bp:GetChildren()) do if t:IsA("Tool") then table.insert(names,t.Name) end end end
+    if c then for _,t in ipairs(c:GetChildren()) do if t:IsA("Tool") and not table.find(names,t.Name) then table.insert(names,t.Name) end end end
+    wd.SetOpts(names) wd.Set(names[1] or "Combat")
+    notify("Vũ khí","Đã nạp "..#names.." vũ khí",3)
+end)
+tog(p1,"Auto Mastery",false,function(v) S.AutoMastery=v if v then AF:StartMastery() else afRestart() end end)
+sec(p1,"AUTO STAT")
+drop(p1,"Chỉ số",{"Melee","Defense","Sword","Gun","Demon Fruit"},"Melee",function(v) S.StatType=v end)
+tog(p1,"Auto cộng điểm",false,function(v) S.AutoStat=v if v then AS:Start() else AS:Stop() end end)
+sec(p1,"FARM MATERIAL")
+local matList={} for k in pairs(MATS) do table.insert(matList,k) end table.sort(matList)
+drop(p1,"Nguyên liệu",matList,"Leather",function(v) S.SelMat=v end)
+tog(p1,"Auto Farm Material",false,function(v) S.AutoMat=v if v then AF:StartMat() else afRestart() end end)
+sec(p1,"BONE / CHEST / ELITE")
+tog(p1,"Auto Farm Bone (Sea 3)",false,function(v) S.AutoBone=v if v then AF:StartBone() else afRestart() end end)
+tog(p1,"Auto Farm Chest",false,function(v) S.AutoChest=v if v then AF:StartChest() else afRestart() end end)
+tog(p1,"Auto Elite Hunter (Sea 3)",false,function(v) S.AutoElite=v if v then AF:StartElite() else afRestart() end end)
+sec(p1,"BAY (WASD + Space/Shift)")
+sld(p1,"Fly Speed",30,400,100,function(v) Fly.Speed=v end)
+tog(p1,"Bật Bay",false,function(v) Fly:Toggle(v) end)
+
+-- ===== TAB 2: BOSS =====
+local p2=pages[2]
+sec(p2,"AUTO BOSS")
+tog(p2,"Auto Hunt Boss (boss nào sống)",false,function(v) S.AutoBoss=v S.AutoBossAll=v if v then BF:Start("",true) else BF:Stop() end end)
+sec(p2,"BOSS RIÊNG")
+local bossList={} for _,b in ipairs(Bosses) do if b.s==SEA then table.insert(bossList,b.n) end end
+if #bossList==0 then bossList={"Bobby"} end
+drop(p2,"Boss",bossList,bossList[1],function(v) S.SelBoss=v end)
+lbl(p2,"Boss chưa spawn: đứng chờ. Boss khác sea sẽ được nhắc.")
+tog(p2,"Auto Farm Boss đã chọn",false,function(v) if v then BF:Start(S.SelBoss,false) else BF:Stop() end end)
+
+-- ===== TAB 3: RAID =====
+local p3=pages[3]
+sec(p3,"RAID (Sea 2/3)")
+drop(p3,"Chip",{"Flame","Ice","Quake","Light","Dark","String","Rumble","Magma","Human: Buddha"},"Flame",function(v) S.Chip=v end)
+tog(p3,"Auto Raid",false,function(v) S.AutoRaid=v if v then RD:Start() else RD:Stop() end end)
+tog(p3,"Auto Awaken",false,function(v) S.AutoAwaken=v if v then AW:Start() else AW:Stop() end end)
+lbl(p3,"Auto Raid: Scientist mua chip → triệu hồi → càn quét.")
+lbl(p3,"Auto Awaken: bật cùng Raid — tỉnh thức skill sau raid.")
+
+-- ===== TAB 4: FRUIT =====
+local p4=pages[4]
+sec(p4,"FRUIT")
+tog(p4,"Auto Collect Fruit",false,function(v) S.AutoFruit=v if S.AutoFruit or S.FruitSniper then FT:Start() else FT:Stop() end end)
+tog(p4,"Fruit Sniper",false,function(v) S.FruitSniper=v if S.AutoFruit or S.FruitSniper then FT:Start() else FT:Stop() end end)
+tog(p4,"Fruit ESP",false,function(v) S.FruitESP=v if v then espStart() else espStopIfIdle() end end)
+btn(p4,"Bay tới Ác Quỷ",function()
+    local f=findFruit()
+    if not f or not f:FindFirstChild("Handle") then notify("Bay tới Ác Quỷ","Không có trái ác quỷ trong map!",4) return end
+    local short,emoji=parseFruit(f.Name)
+    local h=hrp()
+    local dist=h and math.floor((f.Handle.Position-h.Position).Magnitude) or 0
+    notify("Bay tới Ác Quỷ","Đang bay tới "..emoji.." "..short.." ("..dist.."m)",5)
+    Fly:GotoTarget(f.Handle.Position)
+end)
+btn(p4,"Mua Random Fruit (Gacha)",function()
+    task.spawn(function()
+        local npc=findNPCModel("Gacha") or findNPCModel("Zioles")
+        if npc then local p=npc.PrimaryPart or npc:FindFirstChildWhichIsA("BasePart")
+            if p then stopMove() toTarget(p.CFrame*CFrame.new(0,2,4),450)
+                local t0=tick()
+                while tick()-t0<8 do local h=hrp() if not h or (h.Position-p.Position).Magnitude<12 then break end task.wait(0.1) end
+            end end
+        INV("Cousin","Buy")
+        notify("Gacha","Đã mua!",3)
+    end)
+end)
+sec(p4,"HOP SERVER TÌM TRÁI ÁC QUỶ")
+tog(p4,"Auto Hop Find Fruit (tự tìm qua nhiều server)",false,function(v)
+    S.AutoHopFruit=v
+    if v then
+        HopFruit:Start()
+    else
+        HopFruit:Stop()
+    end
+end)
+lbl(p4,"YÊU CẦU: Bật Auto Execute trong executor")
+lbl(p4,"Cách dùng: bật toggle này → script sẽ:")
+lbl(p4,"1. Check server hiện tại có fruit không")
+lbl(p4,"2. Không có → tự hop server khác")
+lbl(p4,"3. Script tự chạy lại ở server mới (cần Auto Exec)")
+lbl(p4,"4. Có fruit → báo + tự bay tới + bật Fruit ESP")
+lbl(p4,"Giới hạn: tối đa 20 server để tránh lag")
+btn(p4,"Hủy Hop Mode (nếu đang hop)",function()
+    if getgenv then getgenv().TNT_HOP_MODE=nil getgenv().TNT_HOP_COUNT=0 end
+    S.AutoHopFruit=false
+    HopFruit:Stop()
+    notify("Hop Fruit","Đã hủy hop mode",3)
+end)
+
+-- ===== TAB 5: SEA EVENTS =====
+local p5=pages[5]
+sec(p5,"TRACKER")
+tog(p5,"Track Sea Events",false,function(v) S.TrackEvents=v if v then EVT:Start() else EVT:Stop() espStopIfIdle() end end)
+sec(p5,"HUNT (TP đến event)")
+for _,e in ipairs(SeaEvents) do
+    btn(p5,"TP "..e,function()
+        local m=findEvent(e)
+        if m then local p=m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+            if p then stopMove() toTarget(p.CFrame*CFrame.new(0,20,0),450) notify("TP","Đã tới "..e,2) return end end
+        notify("TP",e.." hiện không có",3)
+    end)
+end
+
+-- ===== TAB 6: ESP =====
+local p6=pages[6]
+sec(p6,"ESP SIÊU XA (không giới hạn khoảng cách)")
+tog(p6,"ESP Siêu Xa (thấy toàn server)",false,function(v)
+    S.SuperESP=v
+    if v then
+        startSuperESP()
+        notify("ESP Siêu Xa","BẬT! Thấy mọi thứ trong server — không giới hạn khoảng cách",4)
+    else
+        stopSuperESP()
+        notify("ESP Siêu Xa","TẮT",3)
+    end
+    -- Nếu ESP loop đang chạy, sẽ tự pick up trạng thái SuperESP ở cycle kế tiếp
+end)
+lbl(p6,"Siêu Xa: load mob/boss/fruit/chest ở bất kỳ khoảng cách nào")
+lbl(p6,"Hiệu lực với mọi ESP (Player/Boss/Mob/Chest/Fruit)")
+sec(p6,"ESP LOẠI")
+tog(p6,"Player ESP (tên + khoảng cách)",false,function(v) S.PESP=v if v then espStart() else espStopIfIdle() end end)
+tog(p6,"Boss ESP",false,function(v) S.BESP=v if v then espStart() else espStopIfIdle() end end)
+tog(p6,"Mob ESP (Siêu Xa = không giới hạn số con)",false,function(v) S.MESP=v if v then espStart() else espStopIfIdle() end end)
+tog(p6,"Chest ESP",false,function(v) S.CESP=v if v then espStart() else espStopIfIdle() end end)
+tog(p6,"Fruit ESP (tên + emoji + dist)",false,function(v) S.FruitESP=v if v then espStart() else espStopIfIdle() end end)
+
+-- ===== TAB 7: TP =====
+local p7=pages[7]
+sec(p7,"TP ISLAND")
+local iNames={} for _,i in ipairs(Islands) do table.insert(iNames,i.n) end
+drop(p7,"Đảo",iNames,"Starter Island",function(v) S.SelIsland=v end)
+btn(p7,"TP đến đảo",function()
+    for _,i in ipairs(Islands) do if i.n==S.SelIsland then stopMove() toTarget(i.p*CFrame.new(0,25,0),450) notify("TP",i.n,2) return end end
+end)
+sec(p7,"TP PLAYER")
+btn(p7,"TP tới người chơi gần nhất",function()
+    local h=hrp() if not h then return end
+    local best,bdp=nil,math.huge
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p~=LP and p.Character then local ph=p.Character:FindFirstChild("HumanoidRootPart")
+            if ph then local d=(ph.Position-h.Position).Magnitude if d<bdp then bdp=d best=p end end end
+    end
+    if best then toTarget(best.Character.HumanoidRootPart.CFrame*CFrame.new(0,5,0),400) notify("TP",best.Name,2)
+    else notify("TP","Không có ai",3) end
+end)
+sec(p7,"TP BOSS / QUÁI")
+btn(p7,"TP tới boss sống",function()
+    local m=findAnyBoss()
+    if m then toTarget(m.HRP.CFrame*CFrame.new(0,20,0),450) notify("TP",m.Full,2)
+    else notify("TP","Không có boss sống",3) end
+end)
+btn(p7,"TP tới quái quest",function()
+    local qd=getQuest(getLevel(),SEA) or getQuest(0,SEA)
+    stopMove() toTarget(qd.cm*CFrame.new(0,20,0),450) notify("TP",qd.b,2)
+end)
+
+-- ===== TAB 8: PVP =====
+local p8=pages[8]
+sec(p8,"PVP")
+tog(p8,"Aim Assist (ghim camera)",false,function(v) S.AimAssist=v if v then AA:Start() else AA:Stop() end end)
+tog(p8,"Team Check",true,function(v) S.TeamCheck=v end)
+tog(p8,"Bounty Tracker",false,function(v) S.BountyTracker=v if v then BT:Start() else BT:Stop() end end)
+
+-- ===== TAB 9: MISC =====
+local p9=pages[9]
+sec(p9,"SERVER")
+btn(p9,"Auto Rejoin",function() Misc:Rejoin() end)
+btn(p9,"Server Hop",function() hopServer() end)
+sec(p9,"MUA HAKI & SKILL")
+btn(p9,"Mua Buso Haki (25,000)",function() INV("BuyHaki","Buso") notify("Mua","Đã gửi lệnh",3) end)
+btn(p9,"Mua Geppo (10,000)",function() INV("BuyHaki","Geppo") notify("Mua","Đã gửi lệnh",3) end)
+btn(p9,"Mua Soru (200,000)",function() INV("BuyHaki","Soru") notify("Mua","Đã gửi lệnh",3) end)
+btn(p9,"Mua Ken Haki (250,000)",function() INV("KenTalk","Buy") notify("Mua","Đã gửi lệnh",3) end)
+btn(p9,"Học Superhuman (3 triệu)",function() INV("BuySuperhuman") notify("Học","Đã gửi lệnh",3) end)
+btn(p9,"Học Death Step (5 triệu+5k Frag)",function() INV("BuyDeathStep") notify("Học","Đã gửi lệnh",3) end)
+btn(p9,"Học Sharkman Karate (7.5 triệu)",function() INV("BuySharkmanKarate") notify("Học","Đã gửi lệnh",3) end)
+btn(p9,"Học Electric Claw (3 triệu+5k Frag)",function() INV("BuyElectricClaw","Start") task.wait(0.3) INV("BuyElectricClaw") notify("Học","Đã gửi lệnh",3) end)
+btn(p9,"Học Dragon Talon (3 triệu+5k Frag)",function() INV("BuyDragonTalon") notify("Học","Đã gửi lệnh",3) end)
+btn(p9,"Học Godhuman (5 triệu+5k Frag)",function() INV("BuyGodhuman") notify("Học","Đã gửi lệnh",3) end)
+sec(p9,"CHUYỂN BIỂN")
+btn(p9,"Sang Sea 2 (cần Lv 700)",function()
+    if SEA==1 then INV("TravelDressrosa") notify("Travel","Đang sang Sea 2...",3)
+    else notify("Travel","Chỉ dùng ở Sea 1",3) end
+end)
+btn(p9,"Sang Sea 3 (cần Lv 1500)",function()
+    if SEA==2 then INV("TravelZou") notify("Travel","Đang sang Sea 3...",3)
+    else notify("Travel","Chỉ dùng ở Sea 2",3) end
+end)
+btn(p9,"Về Sea trước",function()
+    if SEA==2 then INV("TravelMain")
+    elseif SEA==3 then INV("TravelDressrosa")
+    else notify("Travel","Đang ở Sea 1",3) end
+end)
+sec(p9,"TIỆN ÍCH")
+tog(p9,"Auto Haki Buso",false,function(v) S.AutoHaki=v if v then AH:Start() else AH:Stop() end end)
+tog(p9,"Chế độ Nhẹ (mobile)",IS_MOB,function(v) S.Light=v notify("Chế độ Nhẹ",v and "BẬT" or "TẮT",3) end)
+btn(p9,"FPS Boost",function() Misc:FPS() end)
+btn(p9,"Đổi Team",function()
+    if LP.Team and LP.Team.Name=="Pirates" then INV("SetTeam","Marines") notify("Team","Chuyển sang Marines",3)
+    else INV("SetTeam","Pirates") notify("Team","Chuyển sang Pirates",3) end
+end)
+btn(p9,"Đổi phím ẩn/hiện UI",function()
+    notify("Đổi phím","Nhấn phím bất kỳ trong 3 giây...",3)
+    local c
+    c=UIS.InputBegan:Connect(function(i,g) if g then return end
+        if i.KeyCode~=Enum.KeyCode.Unknown then S.UIToggle=i.KeyCode
+            notify("OK","Phím: "..tostring(i.KeyCode):gsub("Enum.KeyCode.",""),3) c:Disconnect() end end)
+    task.delay(3,function() if c then c:Disconnect() end end)
+end)
+sec(p9,"LƯU TRẠNG THÁI SCRIPT")
+tog(p9,"Auto Restore (lưu + tự khôi phục khi load lại)",false,function(v)
+    S.AutoRestore=v
+    if v then
+        startStateSave()
+        notify("Auto Restore","BẬT! Script sẽ lưu state mỗi 5s\nKhi load lại sẽ tự khôi phục các toggle đã bật",4)
+    else
+        stopStateSave()
+        notify("Auto Restore","TẮT",3)
+    end
+end)
+btn(p9,"Lưu state ngay bây giờ",function()
+    saveState()
+    notify("Auto Restore","Đã lưu state hiện tại!",3)
+end)
+btn(p9,"Xóa state đã lưu",function()
+    clearState()
+    notify("Auto Restore","Đã xóa state đã lưu",3)
+end)
+lbl(p9,"Auto Restore: lưu các toggle đã bật vào file")
+lbl(p9,"Khi script chạy lại (rejoin/hop/restart) → tự khôi phục")
+lbl(p9,"Yêu cầu: executor hỗ trợ writefile/readfile")
+sec(p9,"THÔNG TIN")
+lbl(p9,"Thiết bị: "..(IS_MOB and "Mobile" or "PC"))
+lbl(p9,"Executor: "..(getexecutorname and getexecutorname() or "Unknown"))
+lbl(p9,"Sea: "..SEA.." | Level: "..getLevel().."/3000")
+
+-- ===== DRAG + TOGGLE + MINIMIZE =====
+local dg,ds,sp
+top.InputBegan:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+        dg=true ds=i.Position sp=main.Position
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if dg and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+        local d=i.Position-ds
+        main.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y)
+    end
+end)
+UIS.InputEnded:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dg=false end
+end)
+UIS.InputBegan:Connect(function(i,g) if not g and i.KeyCode==S.UIToggle then gui.Enabled=not gui.Enabled end end)
+local mn=false
+minB.MouseButton1Click:Connect(function()
+    mn=not mn body.Visible=not mn
+    if mn then
+        TS:Create(main,TweenInfo.new(0.15),{Size=UDim2.new(0,260,0,32),Position=UDim2.new(0.5,-130,0,8)}):Play()
+        minB.Text="+"
+    else
+        TS:Create(main,TweenInfo.new(0.15),{Size=UDim2.new(0,W,0,H),Position=UDim2.new(0.5,-W/2,0.5,-H/2)}):Play()
+        minB.Text="-"
+    end
+end)
+closeB.MouseButton1Click:Connect(function() gui.Enabled=false end)
+
+buildJoyUI(gui)
+
+main.Visible=true
+main.Size=UDim2.new(0,W,0,H)
+main.BackgroundTransparency=0
+
+-- ===== RESUME HOP MODE (khi script tự chạy lại sau khi teleport) =====
+-- Nếu trước khi hop, user đã bật AutoHopFruit → script load xong sẽ tiếp tục hunt
+task.spawn(function()
+    task.wait(3)  -- đợi script load xong + character spawn
+    if getgenv and getgenv().TNT_HOP_MODE == "fruit" then
+        local count = getgenv().TNT_HOP_COUNT or 0
+        if count > 20 then
+            -- Giới hạn 20 lần hop để tránh infinite loop
+            getgenv().TNT_HOP_MODE=nil
+            getgenv().TNT_HOP_COUNT=0
+            notify("Hop Fruit","Đã thử 20 server, không tìm thấy trái ác quỷ — dừng lại",6)
+            return
+        end
+        notify("Hop Fruit","Script tự chạy lại! Đang kiểm tra server mới (lần "..count..")...",5)
+        -- Đợi character + workspace load
+        task.wait(2)
+        local f = findFruit()
+        if f and f:FindFirstChild("Handle") then
+            -- TÌM THẤY!
+            local short, emoji = parseFruit(f.Name)
+            notify("TÌM THẤY TRÁI ÁC QUỶ!"," "..emoji.." "..short.." ở server này!",8)
+            if not Fly.On then
+                Fly:GotoTarget(f.Handle.Position)
+            end
+            if not S.FruitESP then
+                S.FruitESP = true
+                espStart()
+            end
+            getgenv().TNT_HOP_MODE = nil
+            getgenv().TNT_HOP_COUNT = 0
+        else
+            -- Không có fruit → hop tiếp
+            notify("Hop Fruit","Server này không có trái — đang hop tiếp...",3)
+            task.wait(2)
+            hopToNextServer()
+        end
+    end
+end)
+
+-- ===== AUTO RESTORE STATE (khi script load, tự restore các toggle đã lưu) =====
+task.spawn(function()
+    task.wait(2)  -- đợi UI load xong
+    if S.AutoRestore then
+        local st = loadState()
+        if st then
+            notify("Auto Restore","Đang khôi phục trạng thái từ lần trước...",3)
+            -- Restore các toggle quan trọng (gọi Start function nếu true)
+            if st.AutoFarm then S.AutoFarm=true AF:StartFarm() end
+            if st.AutoMastery then S.AutoMastery=true AF:StartMastery() end
+            if st.AutoMat then S.AutoMat=true AF:StartMat() end
+            if st.AutoBone then S.AutoBone=true AF:StartBone() end
+            if st.AutoChest then S.AutoChest=true AF:StartChest() end
+            if st.AutoElite then S.AutoElite=true AF:StartElite() end
+            if st.AutoBoss then S.AutoBoss=true S.AutoBossAll=true BF:Start("",true) end
+            if st.AutoRaid then S.AutoRaid=true RD:Start() end
+            if st.AutoAwaken then S.AutoAwaken=true AW:Start() end
+            if st.AutoFruit or st.FruitSniper then
+                S.AutoFruit=st.AutoFruit or false
+                S.FruitSniper=st.FruitSniper or false
+                FT:Start()
+            end
+            if st.AutoHopFruit then S.AutoHopFruit=true HopFruit:Start() end
+            if st.PESP then S.PESP=true espStart() end
+            if st.BESP then S.BESP=true espStart() end
+            if st.MESP then S.MESP=true espStart() end
+            if st.CESP then S.CESP=true espStart() end
+            if st.FruitESP then S.FruitESP=true espStart() end
+            if st.SuperESP then S.SuperESP=true startSuperESP() end
+            if st.TrackEvents then S.TrackEvents=true EVT:Start() end
+            if st.AutoHaki then S.AutoHaki=true AH:Start() end
+            if st.AutoStat then S.AutoStat=true AS:Start() end
+            if st.AimAssist then S.AimAssist=true AA:Start() end
+            if st.BountyTracker then S.BountyTracker=true BT:Start() end
+            -- Restore misc state (không gọi Start)
+            if st.TeamCheck~=nil then S.TeamCheck=st.TeamCheck end
+            if st.Magnet~=nil then S.Magnet=st.Magnet end
+            if st.BringMobSmart~=nil then S.BringMobSmart=st.BringMobSmart end
+            if st.StatType then S.StatType=st.StatType end
+            if st.SelMat then S.SelMat=st.SelMat end
+            if st.SelBoss then S.SelBoss=st.SelBoss end
+            if st.Chip then S.Chip=st.Chip end
+            if st.Weapon then S.Weapon=st.Weapon end
+            if st.FarmH then S.FarmH=st.FarmH end
+            if st.ClickRate then S.ClickRate=st.ClickRate end
+            if st.FlySpeed then Fly.Speed=st.FlySpeed end
+            notify("Auto Restore","Đã khôi phục xong!",3)
+            -- Bắt đầu auto-save state
+            startStateSave()
+        end
+    end
+end)
+
+notify("TNThud v14.0","Đã load! Sea "..SEA.." - Level "..getLevel().."\nMới: Auto Hop Fruit + Auto Restore State",5)
+print("✅ TNThud v14.0 | Sea:",SEA,"| Level:",getLevel(),"| PlaceId:",game.PlaceId,"| Light:",S.Light)
+print("   Auto Restore:",S.AutoRestore,"| Hop Mode:",getgenv and getgenv().TNT_HOP_MODE or "none")
